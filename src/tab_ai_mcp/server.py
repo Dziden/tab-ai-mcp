@@ -1,25 +1,25 @@
 """
-TAB AI MCP Server для 1С
-========================
-Универсальный MCP-агент для взаимодействия с 1С:Предприятие.
+tab_mcp — MCP-коннектор к 1С:Предприятие
+=========================================
+Компонент архитектуры ТАБ:БИИ. Подключает Claude и другие MCP-клиенты к базе 1С.
 
-Возможности:
-- CRUD объектов через стандартный OData REST API 1С
-- Обогащение объектов по схеме EnterpriseData (XDTO)
-- Семантический поиск через TAB AI сервис
-- Синхронизация данных 1С → TAB AI векторный кэш
+Архитектура:
+  tab_mcp → База 1С        (OData REST API — CRUD объектов)
+  tab_mcp → tab_ss         (семантический поиск, прогнозирование, аномалии)
+  tab_ss  → tab_ca         (мультиагент LLM, внутри tab_ss)
+  tab_ss  → LLM провайдеры (openai, deepseek, gigachat и др., через tab_ca)
 
 Установка:
   pip install tab-ai-mcp
-  # или
+  # или (рекомендуется)
   uvx tab-ai-mcp
 
 Конфигурация (переменные окружения):
-  ONEC_BASE_URL   — URL базы 1С, например http://server/myapp
-  ONEC_USERNAME   — Логин 1С
-  ONEC_PASSWORD   — Пароль 1С
-  TAB_AI_API_KEY  — Ключ TAB AI сервиса
-  TAB_AI_BASE_URL — URL TAB AI сервиса (по умолчанию Railway)
+  ONEC_BASE_URL  — URL базы 1С, например http://server/myapp
+  ONEC_USERNAME  — Логин 1С
+  ONEC_PASSWORD  — Пароль 1С
+  TAB_SS_URL     — URL сервиса tab_ss (по умолчанию облачный Railway)
+  TAB_SS_API_KEY — Ключ доступа к tab_ss
 """
 
 from __future__ import annotations
@@ -34,24 +34,35 @@ from mcp.server.fastmcp import FastMCP
 from tab_ai_mcp import odata_client as oc
 from tab_ai_mcp import xdto_enricher as xe
 
-# ── TAB AI Configuration ───────────────────────────────────────────────────────
+# ── tab_ss Configuration ───────────────────────────────────────────────────────
+# tab_ss — сервис семантического поиска, прогнозирования и аномалий.
+# Может работать on-prem (с GPU) или в облаке (Railway).
 
-_TAB_AI_DEFAULT_KEY = "a7f3b8c9d2e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
-_TAB_AI_DEFAULT_URL = "https://test-docker-2-production.up.railway.app"
+_TAB_SS_DEFAULT_KEY = "a7f3b8c9d2e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+_TAB_SS_DEFAULT_URL = "https://test-docker-2-production.up.railway.app"
 
-TAB_AI_KEY = os.environ.get("TAB_AI_API_KEY", _TAB_AI_DEFAULT_KEY)
-TAB_AI_URL = os.environ.get("TAB_AI_BASE_URL", _TAB_AI_DEFAULT_URL).rstrip("/")
+# Поддержка старых имён переменных для обратной совместимости
+TAB_SS_KEY = (
+    os.environ.get("TAB_SS_API_KEY")
+    or os.environ.get("TAB_AI_API_KEY")
+    or _TAB_SS_DEFAULT_KEY
+)
+TAB_SS_URL = (
+    os.environ.get("TAB_SS_URL")
+    or os.environ.get("TAB_AI_BASE_URL")
+    or _TAB_SS_DEFAULT_URL
+).rstrip("/")
 
 
-def _tab_ai_client() -> httpx.AsyncClient:
+def _tab_ss_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        base_url=TAB_AI_URL,
-        headers={"X-Admin-Key": TAB_AI_KEY, "Content-Type": "application/json"},
+        base_url=TAB_SS_URL,
+        headers={"X-Admin-Key": TAB_SS_KEY, "Content-Type": "application/json"},
         timeout=httpx.Timeout(60.0, connect=10.0),
     )
 
 
-def _tab_ai_handle(response: httpx.Response) -> dict[str, Any]:
+def _tab_ss_handle(response: httpx.Response) -> dict[str, Any]:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -59,7 +70,7 @@ def _tab_ai_handle(response: httpx.Response) -> dict[str, Any]:
             detail = exc.response.json()
         except Exception:
             detail = exc.response.text
-        raise RuntimeError(f"HTTP {exc.response.status_code} от TAB AI: {detail}") from exc
+        raise RuntimeError(f"HTTP {exc.response.status_code} от tab_ss: {detail}") from exc
     try:
         return response.json()
     except Exception:
@@ -69,16 +80,17 @@ def _tab_ai_handle(response: httpx.Response) -> dict[str, Any]:
 # ── FastMCP Server ─────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
-    name="tab-ai-1c",
+    name="tab-mcp",
     instructions=(
-        "Агент для работы с 1С:Предприятие через OData REST API и TAB AI семантический поиск.\n\n"
+        "MCP-коннектор к 1С:Предприятие (компонент tab_mcp архитектуры ТАБ:БИИ).\n\n"
+        "Два канала работы:\n"
+        "1. OData → База 1С: чтение/запись объектов напрямую\n"
+        "2. tab_ss: семантический поиск, прогнозирование, аномалии\n\n"
         "Типичные сценарии:\n"
-        "1. Найти объект по смыслу: semantic_search_1c → get_1c_object\n"
-        "2. Создать документ: get_xdto_schema → create_1c_object\n"
-        "3. Запросить данные: query_1c с OData $filter\n"
-        "4. Синхронизировать данные для поиска: sync_1c_to_ai\n\n"
-        "Имена типов OData: Catalog_Номенклатура, Document_СчетПокупателю и т.д.\n"
-        "Для получения полного списка — list_1c_types()"
+        "- Найти объект по смыслу: sync_1c_to_tab_ss → semantic_search_1c → get_1c_object\n"
+        "- Создать документ: get_xdto_schema → create_1c_object\n"
+        "- Запросить данные: query_1c с OData $filter\n\n"
+        "Имена OData типов: Catalog_*, Document_* (полный список — list_1c_types)"
     ),
 )
 
@@ -302,11 +314,11 @@ async def list_xdto_covered_types() -> dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB AI СЕМАНТИЧЕСКИЙ ПОИСК
+# TAB_SS — СЕМАНТИЧЕСКИЙ ПОИСК И АНАЛИТИКА
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def sync_1c_to_ai(
+async def sync_1c_to_tab_ss(
     entity_type: str,
     organization: str,
     object_type_label: str,
@@ -315,10 +327,10 @@ async def sync_1c_to_ai(
     ttl_seconds: int = 86400,
 ) -> dict[str, Any]:
     """
-    Синхронизировать данные из 1С в TAB AI векторный кэш для семантического поиска.
-    Sync 1C data into the TAB AI vector cache for semantic search.
+    Синхронизировать данные из 1С в tab_ss для семантического поиска.
+    Sync 1C data into tab_ss vector cache for semantic search.
 
-    Загружает объекты из 1С через OData и индексирует их в TAB AI для последующего
+    Загружает объекты из 1С через OData и индексирует их в tab_ss для последующего
     семантического поиска (semantic_search_1c).
 
     Args:
@@ -359,7 +371,7 @@ async def sync_1c_to_ai(
 
     items_json = json.dumps(all_items, ensure_ascii=False, default=str)
 
-    async with _tab_ai_client() as client:
+    async with _tab_ss_client() as client:
         response = await client.post(
             "/v1/datasets/load",
             json={
@@ -369,7 +381,7 @@ async def sync_1c_to_ai(
                 "object_type": object_type_label,
             },
         )
-    result = _tab_ai_handle(response)
+    result = _tab_ss_handle(response)
     result["synced_count"] = len(all_items)
     result["entity_type"] = entity_type
     return result
@@ -386,19 +398,19 @@ async def semantic_search_1c(
     min_score: Optional[float] = None,
 ) -> dict[str, Any]:
     """
-    Семантический поиск объектов 1С по смыслу через TAB AI.
-    Semantic search for 1C objects by meaning using TAB AI.
+    Семантический поиск объектов 1С по смыслу через tab_ss.
+    Semantic search for 1C objects by meaning using tab_ss.
 
     Находит объекты по смыслу, не требуя точного совпадения строк.
-    ВАЖНО: Перед поиском нужно загрузить данные через sync_1c_to_ai.
+    ВАЖНО: Перед поиском нужно загрузить данные через sync_1c_to_tab_ss.
 
     Примеры запросов:
     - "молоко пастеризованное" найдёт "Молоко 1% пастеризованное 1л"
     - "токарный станок" найдёт "Станок токарный ТВ-320 б/у"
 
     Args:
-        organization:      Идентификатор организации (как при sync_1c_to_ai).
-        object_type_label: Метка типа объекта (как при sync_1c_to_ai).
+        organization:      Идентификатор организации (как при sync_1c_to_tab_ss).
+        object_type_label: Метка типа объекта (как при sync_1c_to_tab_ss).
         search_text:       Текст для поиска (любое описание, запрос на русском/английском).
         property_name:     По какому свойству искать (по умолчанию "Наименование").
         model:             LLM провайдер: "openai", "deepseek", "qwen", "yandexgpt", "gigachat".
@@ -424,9 +436,9 @@ async def semantic_search_1c(
     if min_score is not None:
         payload["min_score"] = min_score
 
-    async with _tab_ai_client() as client:
+    async with _tab_ss_client() as client:
         response = await client.post("/v1/search", json=payload)
-    return _tab_ai_handle(response)
+    return _tab_ss_handle(response)
 
 
 @mcp.tool()
@@ -461,7 +473,7 @@ async def semantic_search_multi_property(
     ]
     properties_json = json.dumps(props, ensure_ascii=False)
 
-    async with _tab_ai_client() as client:
+    async with _tab_ss_client() as client:
         response = await client.post(
             "/v1/search",
             json={
@@ -472,20 +484,21 @@ async def semantic_search_multi_property(
                 "top_k": top_k,
             },
         )
-    return _tab_ai_handle(response)
+    return _tab_ss_handle(response)
 
 
 @mcp.tool()
-async def set_ai_provider_token(
+async def set_tab_ss_provider_token(
     provider: str,
     token: str,
     expires_at: Optional[str] = None,
 ) -> dict[str, Any]:
     """
-    Настроить API ключ для LLM провайдера в TAB AI сервисе.
-    Set LLM provider API token in the TAB AI service.
+    Настроить API ключ LLM провайдера в tab_ss.
+    Set LLM provider API token in tab_ss (used by tab_ca multi-agent).
 
-    Необходимо для работы семантического поиска с конкретным провайдером.
+    tab_ss передаёт токен в tab_ca, который использует его для вызовов LLM провайдеров
+    (openai, deepseek, gigachat и др.) при семантическом поиске и аналитике.
 
     Args:
         provider:   Провайдер: "openai", "deepseek", "qwen", "yandexgpt", "gigachat".
@@ -498,9 +511,9 @@ async def set_ai_provider_token(
     body: dict[str, Any] = {"provider": provider, "token": token}
     if expires_at:
         body["expires_at"] = expires_at
-    async with _tab_ai_client() as client:
+    async with _tab_ss_client() as client:
         response = await client.post("/v1/providers/tokens", json=body)
-    return _tab_ai_handle(response)
+    return _tab_ss_handle(response)
 
 
 @mcp.tool()
@@ -525,7 +538,7 @@ async def forecast_1c_data(
     Returns:
         Прогнозируемые значения в той же структуре, что входные данные.
     """
-    async with _tab_ai_client() as client:
+    async with _tab_ss_client() as client:
         response = await client.post(
             "/v1/data_dynamics",
             json={
@@ -533,7 +546,7 @@ async def forecast_1c_data(
                 "КоличествоМесяцев": months_count,
             },
         )
-    return _tab_ai_handle(response)
+    return _tab_ss_handle(response)
 
 
 @mcp.tool()
@@ -551,12 +564,12 @@ async def verify_document_signature(document_base64: str) -> dict[str, Any]:
     Returns:
         {"signature_score": 0-100, "stamp_score": 0-100, "overall_score": 0-100}
     """
-    async with _tab_ai_client() as client:
+    async with _tab_ss_client() as client:
         response = await client.post(
             "/v1/verify/signature-stamp",
             json={"document_base64": document_base64},
         )
-    return _tab_ai_handle(response)
+    return _tab_ss_handle(response)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
