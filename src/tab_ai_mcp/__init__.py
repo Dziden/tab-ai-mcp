@@ -6,4 +6,4 @@ tab-ai-mcp: MCP-сервер для 1С.
 и обогащение объектов по схеме EnterpriseData (XDTO).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

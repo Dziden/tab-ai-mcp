@@ -53,6 +53,22 @@ TAB_SS_URL = (
     or _TAB_SS_DEFAULT_URL
 ).rstrip("/")
 
+# Организация по умолчанию для разреза данных в tab_ss.
+# Соответствует конкретной 1С базе, в которой установлено БИИ.
+# Если не задана — Claude должен указывать organisation явно при каждом вызове.
+DEFAULT_ORGANIZATION = os.environ.get("ONEC_ORGANIZATION", "")
+
+
+def _resolve_org(organization: Optional[str]) -> str:
+    """Вернуть organization или DEFAULT_ORGANIZATION; поднять ошибку если оба пусты."""
+    org = organization or DEFAULT_ORGANIZATION
+    if not org:
+        raise RuntimeError(
+            "Укажите organization или задайте переменную окружения ONEC_ORGANIZATION "
+            "(идентификатор 1С базы, в которой установлено БИИ)."
+        )
+    return org
+
 
 def _tab_ss_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -320,8 +336,8 @@ async def list_xdto_covered_types() -> dict[str, Any]:
 @mcp.tool()
 async def sync_1c_to_tab_ss(
     entity_type: str,
-    organization: str,
     object_type_label: str,
+    organization: Optional[str] = None,
     filter: Optional[str] = None,
     select: Optional[str] = None,
     ttl_seconds: int = 86400,
@@ -335,16 +351,20 @@ async def sync_1c_to_tab_ss(
 
     Args:
         entity_type:       OData тип, например "Catalog_Номенклатура".
-        organization:      Идентификатор организации (произвольная строка, например "DEMO").
-                           Используется для изоляции кэша между организациями.
         object_type_label: Метка типа объекта для кэша, например "Номенклатура".
+        organization:      Идентификатор организации в tab_ss (разрез кэша).
+                           Если не указан — берётся из переменной ONEC_ORGANIZATION.
+                           Рекомендуется задать ONEC_ORGANIZATION при установке MCP,
+                           тогда указывать organization не нужно.
         filter:            OData $filter для ограничения синхронизируемых данных.
-        select:            Список полей через запятую (по умолчанию Ref_Key + Наименование + Код).
+        select:            Список полей через запятую. Если не задан — все поля.
         ttl_seconds:       Время жизни кэша в секундах (по умолчанию 86400 = 24ч).
 
     Returns:
         dataset_id, added_count, updated_count — результат индексации.
     """
+    org = _resolve_org(organization)
+
     # Загрузить все объекты из 1С (постранично)
     all_items: list[dict] = []
     skip = 0
@@ -363,10 +383,9 @@ async def sync_1c_to_tab_ss(
     if not all_items:
         return {"error": "Данные не найдены в 1С по заданным параметрам", "entity_type": entity_type}
 
-    # Преобразовать для TAB AI: нужно поле "Код"
+    # tab_ss требует поле "Код" для идентификации объектов
     for item in all_items:
         if "Код" not in item or not item["Код"]:
-            # Использовать Ref_Key как Код если нет своего
             item["Код"] = str(item.get("Ref_Key", ""))
 
     items_json = json.dumps(all_items, ensure_ascii=False, default=str)
@@ -377,21 +396,22 @@ async def sync_1c_to_tab_ss(
             json={
                 "items": items_json,
                 "ttl_seconds": ttl_seconds,
-                "organization": organization,
+                "organization": org,
                 "object_type": object_type_label,
             },
         )
     result = _tab_ss_handle(response)
     result["synced_count"] = len(all_items)
     result["entity_type"] = entity_type
+    result["organization"] = org
     return result
 
 
 @mcp.tool()
 async def semantic_search_1c(
-    organization: str,
     object_type_label: str,
     search_text: str,
+    organization: Optional[str] = None,
     property_name: str = "Наименование",
     model: str = "openai",
     top_k: int = 10,
@@ -409,9 +429,9 @@ async def semantic_search_1c(
     - "токарный станок" найдёт "Станок токарный ТВ-320 б/у"
 
     Args:
-        organization:      Идентификатор организации (как при sync_1c_to_tab_ss).
         object_type_label: Метка типа объекта (как при sync_1c_to_tab_ss).
         search_text:       Текст для поиска (любое описание, запрос на русском/английском).
+        organization:      Идентификатор организации. Если не указан — берётся из ONEC_ORGANIZATION.
         property_name:     По какому свойству искать (по умолчанию "Наименование").
         model:             LLM провайдер: "openai", "deepseek", "qwen", "yandexgpt", "gigachat".
         top_k:             Количество результатов (по умолчанию 10).
@@ -421,6 +441,7 @@ async def semantic_search_1c(
         Список найденных объектов с кодами (Ref_Key) и оценками схожести.
         Затем вызовите get_1c_object для получения полных данных.
     """
+    org = _resolve_org(organization)
     properties = json.dumps(
         [{"line_no": 0, "property": property_name, "value": search_text}],
         ensure_ascii=False,
@@ -428,7 +449,7 @@ async def semantic_search_1c(
 
     payload: dict[str, Any] = {
         "object_type": object_type_label,
-        "organization": organization,
+        "organization": org,
         "model": model,
         "properties": properties,
         "top_k": top_k,
@@ -443,9 +464,9 @@ async def semantic_search_1c(
 
 @mcp.tool()
 async def semantic_search_multi_property(
-    organization: str,
     object_type_label: str,
     search_properties: list[dict[str, str]],
+    organization: Optional[str] = None,
     model: str = "openai",
     top_k: int = 10,
 ) -> dict[str, Any]:
@@ -456,17 +477,18 @@ async def semantic_search_multi_property(
     Для сложных запросов, когда нужно искать по комбинации свойств.
 
     Args:
-        organization:       Идентификатор организации.
         object_type_label:  Метка типа объекта.
         search_properties:  Список свойств для поиска.
                             Формат: [{"property": "Наименование", "value": "молоко"},
                                      {"property": "Описание", "value": "пастеризованное"}]
+        organization:       Идентификатор организации. Если не указан — берётся из ONEC_ORGANIZATION.
         model:              LLM провайдер.
         top_k:              Количество результатов.
 
     Returns:
         Результаты поиска с оценками по каждому свойству.
     """
+    org = _resolve_org(organization)
     props = [
         {"line_no": i, "property": p.get("property", "Наименование"), "value": p.get("value", "")}
         for i, p in enumerate(search_properties)
@@ -478,7 +500,7 @@ async def semantic_search_multi_property(
             "/v1/search",
             json={
                 "object_type": object_type_label,
-                "organization": organization,
+                "organization": org,
                 "model": model,
                 "properties": properties_json,
                 "top_k": top_k,
