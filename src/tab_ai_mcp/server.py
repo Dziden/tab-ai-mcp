@@ -1,47 +1,57 @@
 """
 tab_mcp — MCP-коннектор к 1С:Предприятие
 =========================================
-Компонент архитектуры ТАБ:БИИ. Подключает Claude и другие MCP-клиенты к базе 1С.
+Компонент архитектуры ТАБ:БИИ. Три инструмента:
 
-Архитектура:
-  tab_mcp → База 1С        (OData REST API — CRUD объектов)
-  tab_mcp → tab_ss         (семантический поиск, прогнозирование, аномалии)
-  tab_ss  → tab_ca         (мультиагент LLM, внутри tab_ss)
-  tab_ss  → LLM провайдеры (openai, deepseek, gigachat и др., через tab_ca)
+  read_1c              — чтение данных из 1С через OData
+  write_1c             — запись данных в 1С через OData (upsert)
+  search_1c_metadata   — семантический поиск по метаданным 1С через tab_ss
 
-Установка:
-  pip install tab-ai-mcp
-  # или (рекомендуется)
-  uvx tab-ai-mcp
+При старте:
+  1. Определяет конфигурацию 1С (Бухгалтерия, УНФ, ERP, ЗУП и др.)
+  2. Загружает соответствующие знания и промпты
+  3. Индексирует метаданные 1С в tab_ss для семантического поиска
 
 Конфигурация (переменные окружения):
   ONEC_BASE_URL  — URL базы 1С, например http://server/myapp
   ONEC_USERNAME  — Логин 1С
   ONEC_PASSWORD  — Пароль 1С
-  TAB_SS_URL     — URL сервиса tab_ss (по умолчанию облачный Railway)
-  TAB_SS_API_KEY — Ключ доступа к tab_ss
+  TAB_SS_URL     — URL сервиса tab_ss (semantic search / LLM service)
+  TAB_SS_API_KEY — Ключ доступа к tab_ss (заголовок X-Admin-Key)
+  ONEC_ORGANIZATION — организация в tab_ss; если задана, ею же помечается индекс метаданных
+  TAB_SS_USER_ID / ONEC_USER_ID — опционально, для поиска с разрезом по пользователю
+  TAB_SS_MODEL   — Модель для семантического поиска (по умолчанию: openai)
+  MCP_TRANSPORT  — stdio (по умолчанию) | streamable-http
+  MCP_HOST       — адрес для HTTP транспорта (по умолчанию 0.0.0.0)
+  MCP_PORT       — порт для HTTP транспорта (по умолчанию 8001)
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import logging
 import os
+import time
+from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 from tab_ai_mcp import odata_client as oc
-from tab_ai_mcp import xdto_enricher as xe
+from tab_ai_mcp import config_detector
+from tab_ai_mcp.knowledge import KNOWLEDGE_MAP
+
+logger = logging.getLogger(__name__)
 
 # ── tab_ss Configuration ───────────────────────────────────────────────────────
-# tab_ss — сервис семантического поиска, прогнозирования и аномалий.
-# Может работать on-prem (с GPU) или в облаке (Railway).
 
 _TAB_SS_DEFAULT_KEY = "a7f3b8c9d2e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
 _TAB_SS_DEFAULT_URL = "https://test-docker-2-production.up.railway.app"
 
-# Поддержка старых имён переменных для обратной совместимости
 TAB_SS_KEY = (
     os.environ.get("TAB_SS_API_KEY")
     or os.environ.get("TAB_AI_API_KEY")
@@ -53,32 +63,170 @@ TAB_SS_URL = (
     or _TAB_SS_DEFAULT_URL
 ).rstrip("/")
 
-# Организация по умолчанию для разреза данных в tab_ss.
-# Соответствует конкретной 1С базе, в которой установлено БИИ.
-# Если не задана — Claude должен указывать organisation явно при каждом вызове.
-DEFAULT_ORGANIZATION = os.environ.get("ONEC_ORGANIZATION", "")
+TAB_SS_MODEL = os.environ.get("TAB_SS_MODEL", "openai")
+
+# TTL метаданных в tab_ss — 7 дней (метаданные меняются редко)
+_METADATA_TTL = 7 * 24 * 3600
+
+# ── Лог запросов ───────────────────────────────────────────────────────────────
+
+_LOG_API_KEY = os.environ.get("LOG_API_KEY", TAB_SS_KEY)
+_LOG_MAX_ENTRIES = int(os.environ.get("LOG_MAX_ENTRIES", "2000"))
+_request_log: deque[dict] = deque(maxlen=_LOG_MAX_ENTRIES)
 
 
-def _resolve_org(organization: Optional[str]) -> str:
-    """Вернуть organization или DEFAULT_ORGANIZATION; поднять ошибку если оба пусты."""
-    org = organization or DEFAULT_ORGANIZATION
-    if not org:
-        raise RuntimeError(
-            "Укажите organization или задайте переменную окружения ONEC_ORGANIZATION "
-            "(идентификатор 1С базы, в которой установлено БИИ)."
-        )
-    return org
+def _log_request(
+    tool: str,
+    entity_type: str,
+    resolved: str,
+    params: dict,
+    duration_ms: float,
+    rows: int | None = None,
+    error: str | None = None,
+) -> None:
+    _request_log.append({
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tool": tool,
+        "entity_type": entity_type,
+        "resolved": resolved if resolved != entity_type else None,
+        "params": {k: v for k, v in params.items() if v is not None},
+        "duration_ms": round(duration_ms, 1),
+        "rows": rows,
+        "error": error,
+    })
+
+
+# Локальный кеш метаданных для fallback-поиска без tab_ss
+# {odata_name: description_words_set}
+_LOCAL_METADATA_INDEX: dict[str, set[str]] = {}
+
+# Префиксы OData → (внутренний тип 1С, читаемое название)
+_PREFIX_MAP = {
+    "Catalog_":                       ("Справочник",              "Справочник"),
+    "Document_":                      ("Документ",                "Документ"),
+    "AccumulationRegister_":          ("РегистрНакопления",       "Регистр накопления"),
+    "AccountingRegister_":            ("РегистрБухгалтерии",      "Регистр бухгалтерии"),
+    "InformationRegister_":           ("РегистрСведений",         "Регистр сведений"),
+    "ChartOfAccounts_":               ("ПланСчетов",              "План счетов"),
+    "ChartOfCharacteristicTypes_":    ("ПланВидовХарактеристик",  "План видов характеристик"),
+    "ChartOfCalculationTypes_":       ("ПланВидовРасчета",        "План видов расчёта"),
+    "BusinessProcess_":               ("БизнесПроцесс",           "Бизнес-процесс"),
+    "Task_":                          ("Задача",                  "Задача"),
+    "ExchangePlan_":                  ("ПланОбмена",              "План обмена"),
+    "Constant_":                      ("Константа",               "Константа"),
+}
+
+
+def _split_camel(name: str) -> str:
+    """РеализацияТоваровУслуг → Реализация Товаров Услуг"""
+    import re
+    result = re.sub(r"(?<=[а-яёa-z0-9])(?=[А-ЯЁA-Z])", " ", name)
+    return result
+
+
+def _local_resolve(query: str) -> str | None:
+    """
+    Локальный fallback-резолвер: word-overlap по кешированным описаниям.
+    Используется когда tab_ss недоступен или precompute не готов.
+    """
+    if not _LOCAL_METADATA_INDEX:
+        return None
+    query_words = set(query.lower().split())
+    best_name, best_score = None, 0
+    for odata_name, desc_words in _LOCAL_METADATA_INDEX.items():
+        score = len(query_words & desc_words)
+        if score > best_score:
+            best_name, best_score = odata_name, score
+    if best_score > 0:
+        logger.info("Локальный резолв '%s' → '%s' (score=%d)", query, best_name, best_score)
+        return best_name
+    return None
+
+
+def _parse_entity(name: str) -> tuple[str, str, str, str]:
+    """Разобрать OData имя → (внутренний_тип, читаемое_имя, читаемый_тип, описание)."""
+    for prefix, (internal, readable) in _PREFIX_MAP.items():
+        if name.startswith(prefix):
+            short = name[len(prefix):]
+            words = _split_camel(short)
+            description = f"{readable}: {words}"
+            return internal, short, readable, description
+    return "Прочее", name, "Прочее", name
+
+
+def _looks_like_odata_name(name: str) -> bool:
+    """Проверить похоже ли имя на OData тип (Catalog_*, Document_* и т.д.)"""
+    return any(name.startswith(prefix) for prefix in _PREFIX_MAP)
+
+
+def _normalize_entity_for_read(name: str) -> str:
+    """
+    AccountingRegister_X без суффикса возвращает сгруппированную структуру,
+    неудобную для фильтрации. Автоматически добавляем _RecordType.
+    Не трогаем bound functions (содержат '/') и уже нормализованные имена.
+    """
+    if (
+        name.startswith("AccountingRegister_")
+        and "/" not in name
+        and not name.endswith("_RecordType")
+    ):
+        return name + "_RecordType"
+    return name
+
+
+async def _resolve_entity_type(query: str, model: str = TAB_SS_MODEL) -> str:
+    """
+    Если entity_type — не точное OData-имя, найти подходящий тип через tab_ss.
+    При недоступности tab_ss или незавершённом precompute — fallback на локальный поиск.
+    Возвращает OData-имя или исходный query если не нашли.
+    """
+    org = _metadata_org(os.environ.get("ONEC_BASE_URL", "default"))
+    properties = json.dumps(
+        [{"line_no": 0, "property": "Описание", "value": query}],
+        ensure_ascii=False,
+    )
+    search_body: dict = {
+        "object_type": "1с_метаданные",
+        "organization": org,
+        "model": model,
+        "properties": properties,
+        "top_k": 1,
+    }
+    uid = _tab_ss_user_id()
+    if uid:
+        search_body["user_id"] = uid
+    try:
+        async with _tab_ss_client() as client:
+            response = await client.post("/v1/search", json=search_body)
+        result = _tab_ss_handle(response)
+        hits = result if isinstance(result, list) else result.get("results", [])
+        # Если precompute не готов — hits будет пустым, используем fallback
+        if hits:
+            code = hits[0].get("Код") or hits[0].get("code") or hits[0].get("id", "")
+            if code:
+                logger.info("tab_ss резолв '%s' → '%s'", query, code)
+                return code
+        # precompute ещё не готов или нет совпадений — пробуем локальный поиск
+        local = _local_resolve(query)
+        if local:
+            return local
+    except Exception as exc:
+        logger.warning("tab_ss недоступен для резолва '%s': %s — пробую локальный поиск", query, exc)
+        local = _local_resolve(query)
+        if local:
+            return local
+    return query
 
 
 def _tab_ss_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=TAB_SS_URL,
         headers={"X-Admin-Key": TAB_SS_KEY, "Content-Type": "application/json"},
-        timeout=httpx.Timeout(60.0, connect=10.0),
+        timeout=httpx.Timeout(120.0, connect=10.0),
     )
 
 
-def _tab_ss_handle(response: httpx.Response) -> dict[str, Any]:
+def _tab_ss_handle(response: httpx.Response) -> Any:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -93,505 +241,374 @@ def _tab_ss_handle(response: httpx.Response) -> dict[str, Any]:
         return {"raw": response.text}
 
 
-# ── FastMCP Server ─────────────────────────────────────────────────────────────
+def _metadata_org(base_url: str) -> str:
+    """
+    Идентификатор организации в tab_ss для индекса метаданных OData.
 
-mcp = FastMCP(
-    name="tab-mcp",
-    instructions=(
-        "MCP-коннектор к 1С:Предприятие (компонент tab_mcp архитектуры ТАБ:БИИ).\n\n"
-        "Два канала работы:\n"
-        "1. OData → База 1С: чтение/запись объектов напрямую\n"
-        "2. tab_ss: семантический поиск, прогнозирование, аномалии\n\n"
-        "Типичные сценарии:\n"
-        "- Найти объект по смыслу: sync_1c_to_tab_ss → semantic_search_1c → get_1c_object\n"
-        "- Создать документ: get_xdto_schema → create_1c_object\n"
-        "- Запросить данные: query_1c с OData $filter\n\n"
-        "Имена OData типов: Catalog_*, Document_* (полный список — list_1c_types)"
-    ),
+    Если задан ONEC_ORGANIZATION (или TAB_SS_ORGANIZATION) — используем его,
+    чтобы совпадать с остальными вызовами к tab_ss / документацией ТАБ:БИИ.
+    Иначе — стабильный pseudo-org от хэша URL базы 1С (изоляция без ручной настройки).
+    """
+    explicit = os.environ.get("ONEC_ORGANIZATION") or os.environ.get("TAB_SS_ORGANIZATION")
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    return "meta_" + hashlib.md5(base_url.encode()).hexdigest()[:12]
+
+
+def _tab_ss_user_id() -> str | None:
+    """Опциональный user_id для tab_ss (семантический поиск / изоляция данных)."""
+    raw = os.environ.get("TAB_SS_USER_ID") or os.environ.get("ONEC_USER_ID")
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s or None
+
+
+# ── Базовые инструкции ─────────────────────────────────────────────────────────
+
+_BASE_INSTRUCTIONS = (
+    "MCP-коннектор к 1С:Предприятие (компонент tab_mcp архитектуры ТАБ:БИИ).\n\n"
+    "Два инструмента:\n"
+    "  read_1c  — читает данные из 1С через OData\n"
+    "  write_1c — записывает данные в 1С через OData (upsert)\n\n"
+    "Оба инструмента принимают entity_type как точное OData-имя ИЛИ описание "
+    "на естественном языке — во втором случае автоматически находят нужный тип.\n\n"
+    "Примеры:\n"
+    "  read_1c('Catalog_Номенклатура')       — точное имя\n"
+    "  read_1c('остатки товаров на складе')  — описание, резолвится автоматически\n\n"
+    "Имена OData типов: Catalog_*, Document_*, AccumulationRegister_*, "
+    "AccountingRegister_*, ChartOfAccounts_* и др.\n\n"
+    "Виртуальные таблицы (bound functions) для регистров:\n"
+    "  AccumulationRegister_X/Balance(Period=...) — остатки на дату\n"
+    "  AccumulationRegister_X/Turnovers(StartPeriod=..., EndPeriod=...) — обороты\n"
+    "  AccountingRegister_X/Balance(Period=...) — остатки по счетам\n"
+    "  AccountingRegister_X/Turnovers(StartPeriod=..., EndPeriod=...) — обороты\n"
+    "  AccountingRegister_X/BalanceAndTurnovers(...) — остатки и обороты\n"
+    "Пример: read_1c('AccountingRegister_Хозрасчетный/Balance(Period=datetime\\'2024-12-31T00:00:00\\')')\n"
+    "  с filter='Account_Key eq guid\\'xxx...\\''\n\n"
+    "AccountingRegister_X без суффикса автоматически заменяется на _RecordType для "
+    "получения плоских записей (без группировки по документу).\n"
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1С OData ИНСТРУМЕНТЫ
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Старт: определение конфигурации + индексация метаданных ───────────────────
 
-@mcp.tool()
-async def list_1c_types() -> dict[str, Any]:
-    """
-    Получить список всех типов объектов базы 1С.
-    Get list of all object types in the 1C database.
-
-    Обращается к $metadata OData и возвращает категоризированный список:
-    справочники (Catalog_*), документы (Document_*), регистры и другие.
-
-    Returns:
-        Словарь с ключами catalogs, documents, registers, other, total.
-    """
-    return await oc.get_metadata()
-
-
-@mcp.tool()
-async def query_1c(
-    entity_type: str,
-    filter: Optional[str] = None,
-    select: Optional[str] = None,
-    top: int = 20,
-    skip: int = 0,
-) -> list[dict[str, Any]]:
-    """
-    Запросить список объектов из 1С через OData.
-    Query 1C objects via OData.
-
-    Args:
-        entity_type: OData тип объекта, например "Catalog_Номенклатура" или "Document_СчетПокупателю".
-                     OData entity type name.
-        filter:      OData $filter выражение для фильтрации.
-                     Примеры:
-                       "Наименование eq 'Молоко'"
-                       "startswith(Наименование,'Мол')"
-                       "ДатаДокумента ge datetime'2024-01-01T00:00:00'"
-                       "Контрагент_Key eq guid'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'"
-        select:      Список полей через запятую, например "Ref_Key,Наименование,Цена".
-                     Если не указан — возвращаются все поля.
-        top:         Максимальное количество записей (по умолчанию 20).
-        skip:        Количество записей для пропуска (для пагинации).
-
-    Returns:
-        Список объектов в формате JSON.
-    """
-    return await oc.query(entity_type, filter=filter, select=select, top=top, skip=skip)
-
-
-@mcp.tool()
-async def get_1c_object(entity_type: str, ref_id: str) -> dict[str, Any]:
-    """
-    Получить объект 1С по GUID с обогащением по схеме XDTO EnterpriseData.
-    Get a 1C object by GUID, enriched with XDTO EnterpriseData schema.
-
-    Возвращает объект с ВСЕМИ полями из стандартной схемы EnterpriseData:
-    - Заполненные поля из 1С с реальными значениями
-    - Незаполненные стандартные поля с null
-    - Метаинформацию о схеме в ключе _xdto_schema
-
-    Args:
-        entity_type: OData тип объекта, например "Catalog_Контрагенты".
-        ref_id:      GUID объекта (Ref_Key), например "12345678-1234-1234-1234-123456789012".
-
-    Returns:
-        Полный объект с XDTO обогащением и схемой.
-    """
-    obj = await oc.get_one(entity_type, ref_id)
-    # Обогатить по XDTO схеме
-    xdto_type = xe.find_xdto_type(entity_type)
-    if xdto_type:
-        obj = xe.enrich_object(obj, xdto_type)
-    return obj
-
-
-@mcp.tool()
-async def create_1c_object(
-    entity_type: str,
-    data: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Создать новый объект в 1С через OData.
-    Create a new 1C object via OData.
-
-    Перед созданием рекомендуется вызвать get_xdto_schema(entity_type)
-    чтобы узнать обязательные поля для данного типа объекта.
-
-    Args:
-        entity_type: OData тип объекта, например "Document_СчетПокупателю".
-        data:        Словарь с полями создаваемого объекта.
-                     Пример для счёта:
-                     {
-                       "Дата": "2024-03-23T00:00:00",
-                       "Контрагент_Key": "guid-контрагента",
-                       "Организация_Key": "guid-организации",
-                       "Товары": [{"НоменклатураRef_Key": "guid", "Количество": 5, "Цена": 100}]
-                     }
-
-    Returns:
-        Созданный объект с присвоенным GUID (Ref_Key).
-    """
-    # Проверить обязательные поля из XDTO схемы
-    xdto_type = xe.find_xdto_type(entity_type)
-    missing_required = []
-    if xdto_type:
-        fields = xe.get_xdto_fields(xdto_type)
-        missing_required = [
-            k for k, v in fields.items()
-            if v.get("required") and not k.startswith("@") and k not in data
-            and k not in ("Ref_Key", "DataVersion", "Ссылка")
-        ]
-
-    result = await oc.create(entity_type, data)
-
-    if missing_required:
-        result["_xdto_warning"] = (
-            f"Объект создан, но не заполнены обязательные поля по схеме EnterpriseData: "
-            f"{', '.join(missing_required[:10])}"
+async def _load_instructions() -> tuple[str, list[dict]]:
+    """Определить конфигурацию 1С и вернуть (instructions, prompts)."""
+    try:
+        metadata = await oc.get_metadata()
+        all_types = (
+            metadata.get("catalogs", [])
+            + metadata.get("documents", [])
+            + metadata.get("registers", [])
+            + metadata.get("other", [])
         )
-    return result
+        detected = config_detector.detect(all_types)
+        knowledge = KNOWLEDGE_MAP.get(detected.name)
+
+        instructions = _BASE_INSTRUCTIONS + f"Конфигурация: {detected.name}\n"
+        prompts: list[dict] = []
+        if knowledge:
+            instructions += knowledge.INSTRUCTIONS
+            prompts = knowledge.PROMPTS
+
+        logger.info("Конфигурация: %s (совпадений: %d)", detected.name, detected.confidence)
+        return instructions, prompts
+
+    except Exception as exc:
+        logger.warning("Не удалось определить конфигурацию: %s", exc)
+        return _BASE_INSTRUCTIONS, []
 
 
-@mcp.tool()
-async def update_1c_object(
-    entity_type: str,
-    ref_id: str,
-    data: dict[str, Any],
-) -> dict[str, Any]:
+async def _index_metadata() -> None:
     """
-    Обновить существующий объект 1С (частичное обновление).
-    Partially update an existing 1C object via OData PATCH.
-
-    Args:
-        entity_type: OData тип объекта, например "Catalog_Контрагенты".
-        ref_id:      GUID объекта для обновления.
-        data:        Словарь с полями для изменения (только изменяемые поля).
-                     Неуказанные поля остаются без изменений.
-
-    Returns:
-        Подтверждение обновления или обновлённый объект.
+    Загрузить метаданные 1С в tab_ss для семантического поиска.
+    Вызывается при старте в фоне — не блокирует запуск сервера.
     """
-    return await oc.update(entity_type, ref_id, data)
+    try:
+        metadata = await oc.get_metadata()
+        all_types = (
+            metadata.get("catalogs", [])
+            + metadata.get("documents", [])
+            + metadata.get("registers", [])
+            + metadata.get("other", [])
+        )
 
+        # Фильтруем служебные типы (TabularSection, RecordType и т.п.)
+        skip_suffixes = ("_RecordType", "_RowType")
+        types = [t for t in all_types if not any(t.endswith(s) for s in skip_suffixes)]
 
-@mcp.tool()
-async def delete_1c_object(entity_type: str, ref_id: str) -> dict[str, Any]:
-    """
-    Удалить объект из 1С.
-    Delete an object from 1C via OData.
+        # Строим датасет: каждая запись — один тип объекта
+        items = []
+        for name in types:
+            internal_type, short_name, readable_type, description = _parse_entity(name)
+            item = {
+                "Код": name,                  # OData имя — ключ для read_1c/write_1c
+                "Наименование": short_name,   # читаемое имя
+                "Тип": readable_type,         # категория объекта
+                "Описание": description,      # готовое описание — tab_ss не генерирует, ищет сразу
+            }
+            items.append(item)
+            # Строим локальный индекс для fallback-поиска без tab_ss
+            _LOCAL_METADATA_INDEX[name] = set(description.lower().split()) | set(short_name.lower().split())
 
-    ВНИМАНИЕ: Операция необратима. Убедитесь, что объект не имеет зависимостей.
+        org = _metadata_org(os.environ.get("ONEC_BASE_URL", "default"))
+        items_json = json.dumps(items, ensure_ascii=False, default=str)
 
-    Args:
-        entity_type: OData тип объекта.
-        ref_id:      GUID объекта для удаления.
-
-    Returns:
-        Подтверждение удаления.
-    """
-    return await oc.delete(entity_type, ref_id)
-
-
-@mcp.tool()
-async def get_xdto_schema(type_name: str) -> dict[str, Any]:
-    """
-    Получить схему полей объекта из стандарта EnterpriseData (XDTO).
-    Get field schema for a 1C object type from the EnterpriseData standard.
-
-    Используйте перед созданием объекта, чтобы знать какие поля обязательны,
-    какие типы данных ожидаются, и какова полная структура объекта.
-
-    Args:
-        type_name: Имя типа — можно передать как OData имя ("Catalog_Номенклатура")
-                   или XDTO имя ("Справочник.Номенклатура").
-
-    Returns:
-        Словарь со схемой: обязательные поля, необязательные поля, типы данных.
-        Пример:
-        {
-          "type": "Справочник.Номенклатура",
-          "required_fields": {"Наименование": {"type": "Строка", ...}, ...},
-          "optional_fields": {"Артикул": {"type": "Строка", ...}, ...}
+        load_body = {
+            "items": items_json,
+            "ttl_seconds": _METADATA_TTL,
+            "organization": org,
+            "object_type": "1с_метаданные",
         }
-    """
-    # Попробовать найти через OData маппинг
-    xdto_type = xe.find_xdto_type(type_name)
-    if not xdto_type:
-        # Может быть уже XDTO имя
-        xdto_type = type_name
-    return xe.get_xdto_schema_info(xdto_type)
-
-
-@mcp.tool()
-async def list_xdto_covered_types() -> dict[str, Any]:
-    """
-    Список типов 1С, покрытых схемой EnterpriseData (XDTO).
-    List 1C object types covered by the EnterpriseData schema.
-
-    Типы из этого списка поддерживают обогащение объектов — get_1c_object
-    вернёт полную структуру по стандарту 1С EnterpriseData.
-
-    Returns:
-        Список XDTO типов с разбивкой по категориям.
-    """
-    all_types = xe.list_covered_types()
-    catalogs = [t for t in all_types if t.startswith("Справочник.")]
-    documents = [t for t in all_types if t.startswith("Документ.")]
-    other = [t for t in all_types if not t.startswith(("Справочник.", "Документ."))]
-    return {
-        "catalogs": catalogs,
-        "documents": documents,
-        "other": other,
-        "total": len(all_types),
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB_SS — СЕМАНТИЧЕСКИЙ ПОИСК И АНАЛИТИКА
-# ══════════════════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-async def sync_1c_to_tab_ss(
-    entity_type: str,
-    object_type_label: str,
-    organization: Optional[str] = None,
-    filter: Optional[str] = None,
-    select: Optional[str] = None,
-    ttl_seconds: int = 86400,
-) -> dict[str, Any]:
-    """
-    Синхронизировать данные из 1С в tab_ss для семантического поиска.
-    Sync 1C data into tab_ss vector cache for semantic search.
-
-    Загружает объекты из 1С через OData и индексирует их в tab_ss для последующего
-    семантического поиска (semantic_search_1c).
-
-    Args:
-        entity_type:       OData тип, например "Catalog_Номенклатура".
-        object_type_label: Метка типа объекта для кэша, например "Номенклатура".
-        organization:      Идентификатор организации в tab_ss (разрез кэша).
-                           Если не указан — берётся из переменной ONEC_ORGANIZATION.
-                           Рекомендуется задать ONEC_ORGANIZATION при установке MCP,
-                           тогда указывать organization не нужно.
-        filter:            OData $filter для ограничения синхронизируемых данных.
-        select:            Список полей через запятую. Если не задан — все поля.
-        ttl_seconds:       Время жизни кэша в секундах (по умолчанию 86400 = 24ч).
-
-    Returns:
-        dataset_id, added_count, updated_count — результат индексации.
-    """
-    org = _resolve_org(organization)
-
-    # Загрузить все объекты из 1С (постранично)
-    all_items: list[dict] = []
-    skip = 0
-    batch = 500
-    while True:
-        batch_data = await oc.query(
-            entity_type, filter=filter, select=select, top=batch, skip=skip
+        async with _tab_ss_client() as client:
+            response = await client.post("/v1/datasets/load", json=load_body)
+        result = _tab_ss_handle(response)
+        logger.info(
+            "Метаданные проиндексированы в tab_ss: %d типов, org=%s, результат=%s",
+            len(items), org, result,
         )
-        if not batch_data:
-            break
-        all_items.extend(batch_data)
-        if len(batch_data) < batch:
-            break
-        skip += batch
 
-    if not all_items:
-        return {"error": "Данные не найдены в 1С по заданным параметрам", "entity_type": entity_type}
+    except Exception as exc:
+        logger.warning("Не удалось проиндексировать метаданные в tab_ss: %s", exc)
 
-    # tab_ss требует поле "Код" для идентификации объектов
-    for item in all_items:
-        if "Код" not in item or not item["Код"]:
-            item["Код"] = str(item.get("Ref_Key", ""))
 
-    items_json = json.dumps(all_items, ensure_ascii=False, default=str)
+# ── Сборка MCP сервера ─────────────────────────────────────────────────────────
 
-    async with _tab_ss_client() as client:
-        response = await client.post(
-            "/v1/datasets/load",
-            json={
-                "items": items_json,
-                "ttl_seconds": ttl_seconds,
-                "organization": org,
-                "object_type": object_type_label,
-            },
+def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
+    mcp = FastMCP(name="tab-mcp", instructions=instructions)
+
+    # Регистрируем типовые промпты из knowledge-файла
+    for p in prompts:
+        name = p["name"]
+        description = p["description"]
+        template = p["template"]
+
+        def make_prompt_fn(tmpl: str, desc: str):
+            def prompt_fn(**kwargs: str) -> str:
+                try:
+                    return tmpl.format(**kwargs)
+                except KeyError:
+                    return tmpl
+            prompt_fn.__doc__ = desc
+            return prompt_fn
+
+        mcp.prompt(name=name)(make_prompt_fn(template, description))
+
+    # ── Инструменты ───────────────────────────────────────────────────────────
+
+    @mcp.tool()
+    async def read_1c(
+        entity_type: str,
+        filter: Optional[str] = None,
+        select: Optional[str] = None,
+        top: int = 100,
+        skip: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        Прочитать данные из 1С через OData.
+        Read data from 1C via OData.
+
+        Принимает как точное OData-имя типа, так и описание на естественном языке —
+        во втором случае автоматически находит нужный тип через семантический поиск.
+
+        Args:
+            entity_type: OData тип объекта или описание на русском/английском.
+                         Точное имя: "Catalog_Номенклатура", "AccountingRegister_Хозрасчетный_RecordType"
+                         Описание:   "остатки товаров", "задолженность покупателей"
+            filter:      OData $filter выражение.
+                         Примеры:
+                           "Description eq 'Молоко'"
+                           "Period ge datetime'2024-01-01T00:00:00'"
+                           "AccountDr_Key eq guid'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'"
+            select:      Поля через запятую, например "Ref_Key,Description,Code".
+                         Если не указан — все поля.
+            top:         Количество записей (по умолчанию 100).
+            skip:        Сдвиг для пагинации.
+
+        Returns:
+            Список объектов в формате JSON.
+        """
+        resolved = (
+            entity_type if _looks_like_odata_name(entity_type)
+            else await _resolve_entity_type(entity_type)
         )
-    result = _tab_ss_handle(response)
-    result["synced_count"] = len(all_items)
-    result["entity_type"] = entity_type
-    result["organization"] = org
-    return result
+        resolved = _normalize_entity_for_read(resolved)
+        t0 = time.monotonic()
+        try:
+            result = await oc.query(resolved, filter=filter, select=select, top=top, skip=skip)
+            _log_request("read_1c", entity_type, resolved,
+                         {"filter": filter, "select": select, "top": top, "skip": skip},
+                         (time.monotonic() - t0) * 1000, rows=len(result))
+            return result
+        except Exception as exc:
+            _log_request("read_1c", entity_type, resolved,
+                         {"filter": filter, "select": select, "top": top, "skip": skip},
+                         (time.monotonic() - t0) * 1000, error=str(exc))
+            raise
 
+    @mcp.tool()
+    async def write_1c(
+        entity_type: str,
+        data: dict[str, Any] | list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Записать данные в 1С через OData (upsert).
+        Write data to 1C via OData (upsert).
 
-@mcp.tool()
-async def semantic_search_1c(
-    object_type_label: str,
-    search_text: str,
-    organization: Optional[str] = None,
-    property_name: str = "Наименование",
-    model: str = "openai",
-    top_k: int = 10,
-    min_score: Optional[float] = None,
-) -> dict[str, Any]:
-    """
-    Семантический поиск объектов 1С по смыслу через tab_ss.
-    Semantic search for 1C objects by meaning using tab_ss.
+        Принимает как точное OData-имя типа, так и описание на естественном языке.
 
-    Находит объекты по смыслу, не требуя точного совпадения строк.
-    ВАЖНО: Перед поиском нужно загрузить данные через sync_1c_to_tab_ss.
+        Логика upsert для каждого объекта:
+          - есть Ref_Key → PATCH (обновление существующего)
+          - нет Ref_Key  → POST  (создание нового)
 
-    Примеры запросов:
-    - "молоко пастеризованное" найдёт "Молоко 1% пастеризованное 1л"
-    - "токарный станок" найдёт "Станок токарный ТВ-320 б/у"
+        Args:
+            entity_type: OData тип объекта или описание на русском/английском.
+            data:        Объект или список объектов для записи.
 
-    Args:
-        object_type_label: Метка типа объекта (как при sync_1c_to_tab_ss).
-        search_text:       Текст для поиска (любое описание, запрос на русском/английском).
-        organization:      Идентификатор организации. Если не указан — берётся из ONEC_ORGANIZATION.
-        property_name:     По какому свойству искать (по умолчанию "Наименование").
-        model:             LLM провайдер: "openai", "deepseek", "qwen", "yandexgpt", "gigachat".
-        top_k:             Количество результатов (по умолчанию 10).
-        min_score:         Минимальный порог схожести от -1.0 до 1.0 (опционально).
-
-    Returns:
-        Список найденных объектов с кодами (Ref_Key) и оценками схожести.
-        Затем вызовите get_1c_object для получения полных данных.
-    """
-    org = _resolve_org(organization)
-    properties = json.dumps(
-        [{"line_no": 0, "property": property_name, "value": search_text}],
-        ensure_ascii=False,
-    )
-
-    payload: dict[str, Any] = {
-        "object_type": object_type_label,
-        "organization": org,
-        "model": model,
-        "properties": properties,
-        "top_k": top_k,
-    }
-    if min_score is not None:
-        payload["min_score"] = min_score
-
-    async with _tab_ss_client() as client:
-        response = await client.post("/v1/search", json=payload)
-    return _tab_ss_handle(response)
-
-
-@mcp.tool()
-async def semantic_search_multi_property(
-    object_type_label: str,
-    search_properties: list[dict[str, str]],
-    organization: Optional[str] = None,
-    model: str = "openai",
-    top_k: int = 10,
-) -> dict[str, Any]:
-    """
-    Семантический поиск по нескольким свойствам одновременно.
-    Multi-property semantic search for 1C objects.
-
-    Для сложных запросов, когда нужно искать по комбинации свойств.
-
-    Args:
-        object_type_label:  Метка типа объекта.
-        search_properties:  Список свойств для поиска.
-                            Формат: [{"property": "Наименование", "value": "молоко"},
-                                     {"property": "Описание", "value": "пастеризованное"}]
-        organization:       Идентификатор организации. Если не указан — берётся из ONEC_ORGANIZATION.
-        model:              LLM провайдер.
-        top_k:              Количество результатов.
-
-    Returns:
-        Результаты поиска с оценками по каждому свойству.
-    """
-    org = _resolve_org(organization)
-    props = [
-        {"line_no": i, "property": p.get("property", "Наименование"), "value": p.get("value", "")}
-        for i, p in enumerate(search_properties)
-    ]
-    properties_json = json.dumps(props, ensure_ascii=False)
-
-    async with _tab_ss_client() as client:
-        response = await client.post(
-            "/v1/search",
-            json={
-                "object_type": object_type_label,
-                "organization": org,
-                "model": model,
-                "properties": properties_json,
-                "top_k": top_k,
-            },
+        Returns:
+            Список результатов записи по каждому объекту.
+        """
+        resolved = (
+            entity_type if _looks_like_odata_name(entity_type)
+            else await _resolve_entity_type(entity_type)
         )
-    return _tab_ss_handle(response)
+        items = data if isinstance(data, list) else [data]
+        results = []
+        t0 = time.monotonic()
+        try:
+            for item in items:
+                ref_key = item.get("Ref_Key")
+                if ref_key:
+                    result = await oc.update(resolved, ref_key, item)
+                    results.append({"action": "updated", "Ref_Key": ref_key, "result": result})
+                else:
+                    result = await oc.create(resolved, item)
+                    results.append({"action": "created", "result": result})
+            _log_request("write_1c", entity_type, resolved, {"count": len(items)},
+                         (time.monotonic() - t0) * 1000, rows=len(results))
+            return {"written": len(results), "items": results}
+        except Exception as exc:
+            _log_request("write_1c", entity_type, resolved, {"count": len(items)},
+                         (time.monotonic() - t0) * 1000, error=str(exc))
+            raise
+
+    @mcp.tool()
+    async def count_document_marks(document_base64: str) -> dict[str, Any]:
+        """
+        Подсчитать количество печатей и подписей в документе, определить принадлежность контрагентам.
+        Count stamps and signatures in a document image; attribute each to a contractor.
+
+        Автоматически:
+        - Определяет тип документа: ЭДО (электронные КЭП-подписи) или скан бумажного документа
+        - Исправляет поворот страницы
+        - Извлекает текст через OCR
+        - Определяет контрагентов (продавец, покупатель и т.д.) из текста документа
+        - Сопоставляет каждую печать/подпись с контрагентом по ИНН или названию
+
+        Для ЭДО: каждая цифровая печать = +1 печать И +1 подпись одновременно.
+        Для сканов: круглые штампы и рукописные подписи считаются отдельно.
+
+        Используй этот инструмент когда пользователь спрашивает:
+          «сколько печатей», «кто подписал документ», «есть ли подпись директора»,
+          «сколько подписей в документе», «определи печати и подписи».
+
+        Args:
+            document_base64: Base64-encoded document image (JPG, PNG) or PDF (first page).
+
+        Returns:
+            {
+              "document_type": "edo" | "scan",
+              "contractors": [
+                {"name": "...", "inn": "...", "role": "seller|buyer|other",
+                 "stamps": N, "signatures": N}
+              ],
+              "unmatched_stamps": N,
+              "unmatched_signatures": N
+            }
+        """
+        async with _tab_ss_client() as client:
+            response = await client.post(
+                "/v1/verify/count-marks",
+                json={
+                    "document_base64": document_base64,
+                    "model": TAB_SS_MODEL,
+                },
+            )
+        return _tab_ss_handle(response)
+
+    return mcp
 
 
-@mcp.tool()
-async def set_tab_ss_provider_token(
-    provider: str,
-    token: str,
-    expires_at: Optional[str] = None,
-) -> dict[str, Any]:
-    """
-    Настроить API ключ LLM провайдера в tab_ss.
-    Set LLM provider API token in tab_ss (used by tab_ca multi-agent).
+# ── HTTP сервер логов ──────────────────────────────────────────────────────────
 
-    tab_ss передаёт токен в tab_ca, который использует его для вызовов LLM провайдеров
-    (openai, deepseek, gigachat и др.) при семантическом поиске и аналитике.
+async def _handle_logs_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Минимальный HTTP-обработчик для GET /logs."""
+    try:
+        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+    except asyncio.TimeoutError:
+        writer.close()
+        return
 
-    Args:
-        provider:   Провайдер: "openai", "deepseek", "qwen", "yandexgpt", "gigachat".
-        token:      API ключ провайдера.
-        expires_at: Дата истечения в формате ISO-8601, например "2026-12-31T23:59:59Z".
+    request = raw.decode(errors="replace")
+    first_line = request.split("\n")[0]  # GET /logs?last=100&api_key=... HTTP/1.1
 
-    Returns:
-        Подтверждение сохранения токена.
-    """
-    body: dict[str, Any] = {"provider": provider, "token": token}
-    if expires_at:
-        body["expires_at"] = expires_at
-    async with _tab_ss_client() as client:
-        response = await client.post("/v1/providers/tokens", json=body)
-    return _tab_ss_handle(response)
+    # Парсим путь и query string
+    path = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else "/"
+    path_part, _, qs = path.partition("?")
 
+    def _qs_param(qs: str, key: str) -> str | None:
+        for part in qs.split("&"):
+            k, _, v = part.partition("=")
+            if k == key:
+                return v
+        return None
 
-@mcp.tool()
-async def forecast_1c_data(
-    table_data: list[dict[str, Any]],
-    months_count: int = 3,
-) -> dict[str, Any]:
-    """
-    Спрогнозировать динамику данных 1С на основе исторических записей.
-    Forecast 1C data dynamics based on historical records.
+    # Проверка API ключа (в query string или заголовке X-Api-Key)
+    api_key = _qs_param(qs, "api_key")
+    if not api_key:
+        for line in request.split("\n"):
+            if line.lower().startswith("x-api-key:"):
+                api_key = line.split(":", 1)[1].strip()
+                break
 
-    Соответствует функции ТАБ:БИИ — СпрогнозируйДинамикуИзмененияДанных.
-
-    Args:
-        table_data:   Список записей с историческими данными.
-                      Обязательно наличие колонки с датой (Дата, Date, Period и т.п.)
-                      и числовых колонок (Продажи, Количество, Сумма и т.п.).
-                      Пример: [{"Дата": "2024-01-15", "Продажи": 100, "Заявки": 10}, ...]
-                      Рекомендуется 12-48 месяцев истории.
-        months_count: Количество месяцев для прогноза (по умолчанию 3).
-
-    Returns:
-        Прогнозируемые значения в той же структуре, что входные данные.
-    """
-    async with _tab_ss_client() as client:
-        response = await client.post(
-            "/v1/data_dynamics",
-            json={
-                "ТаблицаДанных": table_data,
-                "КоличествоМесяцев": months_count,
-            },
+    def _respond(status: str, body: str) -> None:
+        body_bytes = body.encode()
+        resp = (
+            f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_bytes)}\r\n"
+            f"Access-Control-Allow-Origin: *\r\n"
+            f"\r\n"
         )
-    return _tab_ss_handle(response)
+        writer.write(resp.encode() + body_bytes)
 
-
-@mcp.tool()
-async def verify_document_signature(document_base64: str) -> dict[str, Any]:
-    """
-    Проверить наличие подписи и печати на документе 1С.
-    Verify signature and stamp presence on a 1C document scan.
-
-    Соответствует функции ТАБ:БИИ — ЕстьЛиПодписьИПечатьНаДокументе.
-
-    Args:
-        document_base64: Документ (скан/PDF) в формате Base64.
-                         Поддерживаемые форматы: PDF, JPG.
-
-    Returns:
-        {"signature_score": 0-100, "stamp_score": 0-100, "overall_score": 0-100}
-    """
-    async with _tab_ss_client() as client:
-        response = await client.post(
-            "/v1/verify/signature-stamp",
-            json={"document_base64": document_base64},
+    if path_part not in ("/logs", "/logs/"):
+        _respond("404 Not Found", '{"error":"not found"}')
+    elif api_key != _LOG_API_KEY:
+        _respond("401 Unauthorized", '{"error":"invalid api_key"}')
+    else:
+        last = int(_qs_param(qs, "last") or len(_request_log))
+        entries = list(_request_log)[-last:]
+        body = json.dumps(
+            {"count": len(entries), "total": len(_request_log), "logs": entries},
+            ensure_ascii=False,
         )
-    return _tab_ss_handle(response)
+        _respond("200 OK", body)
+
+    try:
+        await writer.drain()
+    except Exception:
+        pass
+    writer.close()
+
+
+async def _serve_logs(host: str, port: int) -> None:
+    """Запустить HTTP сервер логов."""
+    server = await asyncio.start_server(_handle_logs_http, host, port)
+    logger.info("Сервер логов: http://%s:%d/logs?api_key=<key>", host, port)
+    async with server:
+        await server.serve_forever()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -600,10 +617,42 @@ async def verify_document_signature(document_base64: str) -> dict[str, Any]:
 
 def main() -> None:
     """
-    Запуск MCP-сервера через stdio транспорт.
-    Используется командой tab-ai-mcp и uvx tab-ai-mcp.
+    Запуск MCP-сервера.
+
+    Транспорт задаётся переменной окружения MCP_TRANSPORT:
+      stdio            — для Claude Desktop / Claude Code (по умолчанию)
+      streamable-http  — для вызовов из tab_ss и других сервисов по сети
     """
-    mcp.run(transport="stdio")
+    instructions, prompts = asyncio.run(_load_instructions())
+    mcp = _make_mcp(instructions, prompts)
+
+    # Индексация метаданных в tab_ss — в фоне, не блокирует старт
+    async def _background_index() -> None:
+        await _index_metadata()
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    log_host = os.environ.get("LOG_HOST", "0.0.0.0")
+    log_port = int(os.environ.get("LOG_PORT", "8002"))
+
+    if transport == "streamable-http":
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8001"))
+
+        async def _run_with_index() -> None:
+            await asyncio.gather(
+                _background_index(),
+                _serve_logs(log_host, log_port),
+                mcp.run_async(transport="streamable-http", host=host, port=port),
+            )
+        asyncio.run(_run_with_index())
+    else:
+        # stdio: индексируем и запускаем лог-сервер в фоне
+        async def _start_logs_in_background() -> None:
+            await _background_index()
+            asyncio.get_event_loop().create_task(_serve_logs(log_host, log_port))
+
+        asyncio.run(_start_logs_in_background())
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
