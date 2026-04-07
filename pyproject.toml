@@ -2,7 +2,6 @@
 name = "tab-ai-mcp"
 version = "0.2.9"
 description = "MCP-сервер для 1С: семантический поиск, CRUD через OData, обогащение объектов по EnterpriseData схеме"
-readme = "README.md"
 license = { text = "MIT" }
 authors = [
     { name = "TAB AI", email = "support@tab-ai.ru" }
