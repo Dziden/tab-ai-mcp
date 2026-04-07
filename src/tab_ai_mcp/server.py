@@ -581,7 +581,10 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             raise
 
     @mcp.tool()
-    async def count_document_marks(document_base64: str) -> dict[str, Any]:
+    async def count_document_marks(
+        document_base64: str,
+        model: Optional[str] = None,
+    ) -> dict[str, Any]:
         """
         Подсчитать количество печатей и подписей в документе, определить принадлежность контрагентам.
         Count stamps and signatures in a document image; attribute each to a contractor.
@@ -602,6 +605,8 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
         Args:
             document_base64: Base64-encoded document image (JPG, PNG) or PDF (first page).
+            model: LLM provider for contractor extraction: "openai" | "deepseek" | "qwen" |
+                   "yandexgpt" | "gigachat". If omitted, uses TAB_SS_MODEL env variable.
 
         Returns:
             {
@@ -619,7 +624,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                 "/v1/verify/count-marks",
                 json={
                     "document_base64": document_base64,
-                    "model": TAB_SS_MODEL,
+                    "model": model or TAB_SS_MODEL,
                 },
             )
         return _tab_ss_handle(response)

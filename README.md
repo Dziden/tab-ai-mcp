@@ -76,13 +76,29 @@ tab-ai-mcp
 | `ONEC_BASE_URL` | URL базы 1С, например `http://server/myapp` | — (обязательно) |
 | `ONEC_USERNAME` | Логин пользователя 1С | — |
 | `ONEC_PASSWORD` | Пароль пользователя 1С | — |
-| `ONEC_ORGANIZATION` | Идентификатор организации в tab_ss (разрез данных) | — (рекомендуется) |
-| `TAB_SS_URL` | URL сервиса tab_ss (on-prem или облако) | облако Railway |
-| `TAB_SS_API_KEY` | Ключ доступа к tab_ss | встроенный ключ |
+| `ONEC_ORGANIZATION` | Идентификатор организации в tab_ss (разрез данных). Если задан, также используется для индекса метаданных OData (`/v1/datasets/load`). Если не задан — для метаданных берётся стабильный ключ `meta_<hash>` от URL базы 1С | — (рекомендуется) |
+| `TAB_SS_ORGANIZATION` | То же, что `ONEC_ORGANIZATION` (альтернативное имя) | — |
+| `TAB_SS_USER_ID` | Необязательный идентификатор пользователя для `POST /v1/search` (если tab_ss настроен на разрез по пользователю) | — |
+| `ONEC_USER_ID` | Альтернатива `TAB_SS_USER_ID` | — |
+| `TAB_SS_URL` | URL сервиса tab_ss (on-prem или облако), например `http://127.0.0.1:8000` при локальном запуске LLM Semantic Search Service | облако Railway (`test-docker-2-production…`) |
+| `TAB_SS_API_KEY` | Ключ доступа к tab_ss (`X-Admin-Key`) | встроенный ключ |
 
 > **Обратная совместимость:** принимаются также `TAB_AI_BASE_URL` и `TAB_AI_API_KEY`.
 
-> Если `ONEC_ORGANIZATION` не задан, его нужно передавать в каждом вызове `sync_1c_to_tab_ss` и `semantic_search_1c`.
+### Локальная отладка с tab_ss (semantic search service)
+
+Поднимите сервис семантического поиска (например, репозиторий **Test Docker 2** / LLM Semantic Search Service) и укажите:
+
+```json
+"env": {
+  "TAB_SS_URL": "http://127.0.0.1:8000",
+  "TAB_SS_API_KEY": "<тот же ключ, что ADMIN_API_KEY у сервиса>"
+}
+```
+
+MCP вызывает `POST /v1/datasets/load` (индексация метаданных OData) и `POST /v1/search` (резолв типа по описанию).
+
+> Если `ONEC_ORGANIZATION` не задан, для метаданных используется вычисляемый ключ `meta_<hash>` от URL 1С; поиск по метаданным всё равно согласован с этим ключом.
 
 > **Требование к 1С:** опубликованный OData сервис.
 > Конфигуратор → Администрирование → Публикация на веб-сервере → "Опубликовать стандартный интерфейс OData"
