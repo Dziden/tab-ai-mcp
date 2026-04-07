@@ -1,6 +1,6 @@
 [project]
 name = "tab-ai-mcp"
-version = "0.1.1"
+version = "0.2.9"
 description = "MCP-сервер для 1С: семантический поиск, CRUD через OData, обогащение объектов по EnterpriseData схеме"
 readme = "README.md"
 license = { text = "MIT" }
@@ -22,6 +22,7 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "httpx>=0.27.0",
     "lxml>=5.0.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.scripts]

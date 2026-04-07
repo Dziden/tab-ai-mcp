@@ -68,6 +68,12 @@ TAB_SS_MODEL = os.environ.get("TAB_SS_MODEL", "openai")
 # TTL метаданных в tab_ss — 7 дней (метаданные меняются редко)
 _METADATA_TTL = 7 * 24 * 3600
 
+# ── Кеш credentials 1С ────────────────────────────────────────────────────────
+# Ключ: (organization, user_id) → {"odata_base_url", "login", "password", ...}
+# TTL 5 минут — не держим пароли долго, но и не долбим tab_ss на каждый запрос
+_CONN_CACHE: dict[tuple[str, str], tuple[dict, float]] = {}
+_CONN_CACHE_TTL = 300.0
+
 # ── Лог запросов ───────────────────────────────────────────────────────────────
 
 _LOG_API_KEY = os.environ.get("LOG_API_KEY", TAB_SS_KEY)
@@ -174,13 +180,18 @@ def _normalize_entity_for_read(name: str) -> str:
     return name
 
 
-async def _resolve_entity_type(query: str, model: str = TAB_SS_MODEL) -> str:
+async def _resolve_entity_type(
+    query: str,
+    model: str = TAB_SS_MODEL,
+    organization: str = "",
+    user_id: str = "",
+) -> str:
     """
     Если entity_type — не точное OData-имя, найти подходящий тип через tab_ss.
     При недоступности tab_ss или незавершённом precompute — fallback на локальный поиск.
     Возвращает OData-имя или исходный query если не нашли.
     """
-    org = _metadata_org(os.environ.get("ONEC_BASE_URL", "default"))
+    org = _metadata_org(organization or os.environ.get("ONEC_BASE_URL", "default"))
     properties = json.dumps(
         [{"line_no": 0, "property": "Описание", "value": query}],
         ensure_ascii=False,
@@ -262,6 +273,49 @@ def _tab_ss_user_id() -> str | None:
         return None
     s = str(raw).strip()
     return s or None
+
+
+async def _fetch_onec_credentials(organization: str, user_id: str) -> dict:
+    """
+    Получить credentials 1С из tab_ss для данной пары (organization, user_id).
+    Результат кешируется на TTL=5 мин.
+
+    Fallback: если tab_ss недоступен и заданы ONEC_BASE_URL/ONEC_USERNAME/ONEC_PASSWORD
+    в env — использовать их (для локальной разработки и обратной совместимости).
+    """
+    cache_key = (organization, user_id)
+    cached, ts = _CONN_CACHE.get(cache_key, ({}, 0.0))
+    if cached and (time.monotonic() - ts) < _CONN_CACHE_TTL:
+        return cached
+
+    try:
+        async with _tab_ss_client() as client:
+            response = await client.post(
+                "/v1/onec/connections/resolve",
+                params={"organization": organization, "user_id": user_id},
+            )
+        conn = _tab_ss_handle(response)
+        _CONN_CACHE[cache_key] = (conn, time.monotonic())
+        return conn
+    except Exception as exc:
+        # Fallback на env переменные (локальная разработка)
+        base_url = os.environ.get("ONEC_BASE_URL", "")
+        if base_url:
+            logger.warning(
+                "tab_ss недоступен для credentials org=%s uid=%s (%s) — использую ONEC_* env",
+                organization, user_id, exc,
+            )
+            return {
+                "odata_base_url": base_url.rstrip("/"),
+                "login": os.environ.get("ONEC_USERNAME", ""),
+                "password": os.environ.get("ONEC_PASSWORD", ""),
+                "verify_ssl": True,
+                "timeout_seconds": 120,
+            }
+        raise RuntimeError(
+            f"Не удалось получить credentials 1С для organization='{organization}', "
+            f"user_id='{user_id}': {exc}"
+        ) from exc
 
 
 # ── Базовые инструкции ─────────────────────────────────────────────────────────
@@ -400,6 +454,9 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
     @mcp.tool()
     async def read_1c(
         entity_type: str,
+        organization: str,
+        user_id: str = "",
+        model: str = TAB_SS_MODEL,
         filter: Optional[str] = None,
         select: Optional[str] = None,
         top: int = 100,
@@ -409,69 +466,85 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         Прочитать данные из 1С через OData.
         Read data from 1C via OData.
 
-        Принимает как точное OData-имя типа, так и описание на естественном языке —
-        во втором случае автоматически находит нужный тип через семантический поиск.
+        Credentials (URL базы, логин, пароль) получаются автоматически из tab_ss
+        по паре (organization, user_id) — не передаются явно.
 
         Args:
-            entity_type: OData тип объекта или описание на русском/английском.
-                         Точное имя: "Catalog_Номенклатура", "AccountingRegister_Хозрасчетный_RecordType"
-                         Описание:   "остатки товаров", "задолженность покупателей"
-            filter:      OData $filter выражение.
-                         Примеры:
-                           "Description eq 'Молоко'"
-                           "Period ge datetime'2024-01-01T00:00:00'"
-                           "AccountDr_Key eq guid'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'"
-            select:      Поля через запятую, например "Ref_Key,Description,Code".
-                         Если не указан — все поля.
-            top:         Количество записей (по умолчанию 100).
-            skip:        Сдвиг для пагинации.
+            entity_type:  OData тип объекта или описание на русском/английском.
+                          Точное имя: "Catalog_Номенклатура", "AccountingRegister_Хозрасчетный"
+                          Описание:   "остатки товаров", "задолженность покупателей"
+            organization: Код организации (ключ подключения к 1С в tab_ss).
+            user_id:      ID пользователя для изоляции подключений (по умолчанию "").
+            model:        Модель семантического поиска (openai, deepseek, qwen32 и др.).
+            filter:       OData $filter выражение.
+                          Примеры:
+                            "Description eq 'Молоко'"
+                            "Period ge datetime'2024-01-01T00:00:00'"
+            select:       Поля через запятую. Если не указан — все поля.
+            top:          Количество записей (по умолчанию 100).
+            skip:         Сдвиг для пагинации.
 
         Returns:
             Список объектов в формате JSON.
         """
+        conn = await _fetch_onec_credentials(organization, user_id)
         resolved = (
             entity_type if _looks_like_odata_name(entity_type)
-            else await _resolve_entity_type(entity_type)
+            else await _resolve_entity_type(entity_type, model=model, organization=organization, user_id=user_id)
         )
         resolved = _normalize_entity_for_read(resolved)
         t0 = time.monotonic()
         try:
-            result = await oc.query(resolved, filter=filter, select=select, top=top, skip=skip)
+            result = await oc.query(
+                resolved, filter=filter, select=select, top=top, skip=skip,
+                base_url=conn["odata_base_url"],
+                login=conn["login"],
+                password=conn["password"],
+                verify_ssl=conn.get("verify_ssl", True),
+                timeout=conn.get("timeout_seconds", 120),
+            )
             _log_request("read_1c", entity_type, resolved,
-                         {"filter": filter, "select": select, "top": top, "skip": skip},
+                         {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, rows=len(result))
             return result
         except Exception as exc:
             _log_request("read_1c", entity_type, resolved,
-                         {"filter": filter, "select": select, "top": top, "skip": skip},
+                         {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, error=str(exc))
             raise
 
     @mcp.tool()
     async def write_1c(
         entity_type: str,
+        organization: str,
         data: dict[str, Any] | list[dict[str, Any]],
+        user_id: str = "",
+        model: str = TAB_SS_MODEL,
     ) -> dict[str, Any]:
         """
         Записать данные в 1С через OData (upsert).
         Write data to 1C via OData (upsert).
 
-        Принимает как точное OData-имя типа, так и описание на естественном языке.
+        Credentials получаются автоматически из tab_ss по (organization, user_id).
 
-        Логика upsert для каждого объекта:
+        Логика upsert:
           - есть Ref_Key → PATCH (обновление существующего)
           - нет Ref_Key  → POST  (создание нового)
 
         Args:
-            entity_type: OData тип объекта или описание на русском/английском.
-            data:        Объект или список объектов для записи.
+            entity_type:  OData тип объекта или описание на русском/английском.
+            organization: Код организации.
+            data:         Объект или список объектов для записи.
+            user_id:      ID пользователя (по умолчанию "").
+            model:        Модель семантического поиска для резолва entity_type.
 
         Returns:
-            Список результатов записи по каждому объекту.
+            {"written": N, "items": [...]}
         """
+        conn = await _fetch_onec_credentials(organization, user_id)
         resolved = (
             entity_type if _looks_like_odata_name(entity_type)
-            else await _resolve_entity_type(entity_type)
+            else await _resolve_entity_type(entity_type, model=model, organization=organization, user_id=user_id)
         )
         items = data if isinstance(data, list) else [data]
         results = []
@@ -480,16 +553,30 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             for item in items:
                 ref_key = item.get("Ref_Key")
                 if ref_key:
-                    result = await oc.update(resolved, ref_key, item)
+                    result = await oc.update(
+                        resolved, ref_key, item,
+                        base_url=conn["odata_base_url"],
+                        login=conn["login"],
+                        password=conn["password"],
+                        verify_ssl=conn.get("verify_ssl", True),
+                        timeout=conn.get("timeout_seconds", 120),
+                    )
                     results.append({"action": "updated", "Ref_Key": ref_key, "result": result})
                 else:
-                    result = await oc.create(resolved, item)
+                    result = await oc.create(
+                        resolved, item,
+                        base_url=conn["odata_base_url"],
+                        login=conn["login"],
+                        password=conn["password"],
+                        verify_ssl=conn.get("verify_ssl", True),
+                        timeout=conn.get("timeout_seconds", 120),
+                    )
                     results.append({"action": "created", "result": result})
-            _log_request("write_1c", entity_type, resolved, {"count": len(items)},
+            _log_request("write_1c", entity_type, resolved, {"org": organization, "count": len(items)},
                          (time.monotonic() - t0) * 1000, rows=len(results))
             return {"written": len(results), "items": results}
         except Exception as exc:
-            _log_request("write_1c", entity_type, resolved, {"count": len(items)},
+            _log_request("write_1c", entity_type, resolved, {"org": organization, "count": len(items)},
                          (time.monotonic() - t0) * 1000, error=str(exc))
             raise
 
@@ -540,75 +627,29 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
     return mcp
 
 
-# ── HTTP сервер логов ──────────────────────────────────────────────────────────
+# ── /logs endpoint (Starlette) ─────────────────────────────────────────────────
 
-async def _handle_logs_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Минимальный HTTP-обработчик для GET /logs."""
-    try:
-        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-    except asyncio.TimeoutError:
-        writer.close()
-        return
+def _logs_asgi_app():
+    """Возвращает ASGI-приложение для эндпоинта GET /logs."""
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
 
-    request = raw.decode(errors="replace")
-    first_line = request.split("\n")[0]  # GET /logs?last=100&api_key=... HTTP/1.1
-
-    # Парсим путь и query string
-    path = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else "/"
-    path_part, _, qs = path.partition("?")
-
-    def _qs_param(qs: str, key: str) -> str | None:
-        for part in qs.split("&"):
-            k, _, v = part.partition("=")
-            if k == key:
-                return v
-        return None
-
-    # Проверка API ключа (в query string или заголовке X-Api-Key)
-    api_key = _qs_param(qs, "api_key")
-    if not api_key:
-        for line in request.split("\n"):
-            if line.lower().startswith("x-api-key:"):
-                api_key = line.split(":", 1)[1].strip()
-                break
-
-    def _respond(status: str, body: str) -> None:
-        body_bytes = body.encode()
-        resp = (
-            f"HTTP/1.1 {status}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body_bytes)}\r\n"
-            f"Access-Control-Allow-Origin: *\r\n"
-            f"\r\n"
-        )
-        writer.write(resp.encode() + body_bytes)
-
-    if path_part not in ("/logs", "/logs/"):
-        _respond("404 Not Found", '{"error":"not found"}')
-    elif api_key != _LOG_API_KEY:
-        _respond("401 Unauthorized", '{"error":"invalid api_key"}')
-    else:
-        last = int(_qs_param(qs, "last") or len(_request_log))
+    async def logs_endpoint(request: Request) -> Response:
+        # Проверка ключа: query string ?api_key=... или заголовок X-Api-Key
+        api_key = request.query_params.get("api_key") or request.headers.get("x-api-key", "")
+        if api_key != _LOG_API_KEY:
+            return JSONResponse({"error": "invalid api_key"}, status_code=401)
+        last_str = request.query_params.get("last", "")
+        last = int(last_str) if last_str.isdigit() else len(_request_log)
         entries = list(_request_log)[-last:]
-        body = json.dumps(
+        return JSONResponse(
             {"count": len(entries), "total": len(_request_log), "logs": entries},
-            ensure_ascii=False,
+            headers={"Access-Control-Allow-Origin": "*"},
         )
-        _respond("200 OK", body)
 
-    try:
-        await writer.drain()
-    except Exception:
-        pass
-    writer.close()
-
-
-async def _serve_logs(host: str, port: int) -> None:
-    """Запустить HTTP сервер логов."""
-    server = await asyncio.start_server(_handle_logs_http, host, port)
-    logger.info("Сервер логов: http://%s:%d/logs?api_key=<key>", host, port)
-    async with server:
-        await server.serve_forever()
+    from starlette.routing import Route
+    from starlette.applications import Starlette
+    return Starlette(routes=[Route("/logs", logs_endpoint)])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -622,36 +663,38 @@ def main() -> None:
     Транспорт задаётся переменной окружения MCP_TRANSPORT:
       stdio            — для Claude Desktop / Claude Code (по умолчанию)
       streamable-http  — для вызовов из tab_ss и других сервисов по сети
+
+    Для Railway: PORT задаётся автоматически; /logs доступен на том же порту.
     """
     instructions, prompts = asyncio.run(_load_instructions())
     mcp = _make_mcp(instructions, prompts)
 
-    # Индексация метаданных в tab_ss — в фоне, не блокирует старт
-    async def _background_index() -> None:
-        await _index_metadata()
-
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
-    log_host = os.environ.get("LOG_HOST", "0.0.0.0")
-    log_port = int(os.environ.get("LOG_PORT", "8002"))
 
     if transport == "streamable-http":
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+
         host = os.environ.get("MCP_HOST", "0.0.0.0")
-        port = int(os.environ.get("MCP_PORT", "8001"))
+        # Railway задаёт PORT; MCP_PORT как явный override
+        port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8001")
 
-        async def _run_with_index() -> None:
+        # Монтируем /logs в тот же Starlette app что и MCP
+        mcp_app = mcp.streamable_http_app()
+        mcp_app.mount("/", app=_logs_asgi_app())
+
+        logger.info("MCP + /logs: http://%s:%d  (транспорт: streamable-http)", host, port)
+
+        async def _run_all() -> None:
             await asyncio.gather(
-                _background_index(),
-                _serve_logs(log_host, log_port),
-                mcp.run_async(transport="streamable-http", host=host, port=port),
+                _index_metadata(),
+                uvicorn.Server(uvicorn.Config(mcp_app, host=host, port=port, log_level="warning")).serve(),
             )
-        asyncio.run(_run_with_index())
+        asyncio.run(_run_all())
     else:
-        # stdio: индексируем и запускаем лог-сервер в фоне
-        async def _start_logs_in_background() -> None:
-            await _background_index()
-            asyncio.get_event_loop().create_task(_serve_logs(log_host, log_port))
-
-        asyncio.run(_start_logs_in_background())
+        # stdio: индексируем метаданные перед запуском
+        asyncio.run(_index_metadata())
         mcp.run(transport="stdio")
 
 

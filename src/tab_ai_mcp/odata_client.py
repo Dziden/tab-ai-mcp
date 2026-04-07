@@ -2,45 +2,60 @@
 1С OData HTTP клиент.
 
 Взаимодействует с 1С через стандартный OData REST API:
-  {ONEC_BASE_URL}/odata/standard.odata/
+  {base_url}/odata/standard.odata/
+
+Credentials передаются per-call (base_url, login, password) —
+не хранятся как глобальные переменные.
+Для обратной совместимости и локальной разработки читаются из env как fallback.
 """
 
 from __future__ import annotations
 
 import os
+import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
 
 import httpx
 
-ONEC_BASE_URL = os.environ.get("ONEC_BASE_URL", "").rstrip("/")
-ONEC_USERNAME = os.environ.get("ONEC_USERNAME", "")
-ONEC_PASSWORD = os.environ.get("ONEC_PASSWORD", "")
+# Fallback для локальной разработки (env переменные)
+_ENV_BASE_URL = os.environ.get("ONEC_BASE_URL", "").rstrip("/")
+_ENV_USERNAME = os.environ.get("ONEC_USERNAME", "")
+_ENV_PASSWORD = os.environ.get("ONEC_PASSWORD", "")
 
 _ODATA_NS = "http://docs.oasis-open.org/odata/ns/edm"
 _ODATA_META_NS = "http://docs.oasis-open.org/odata/ns/edmx"
 
 
-def _odata_url() -> str:
-    if not ONEC_BASE_URL:
-        raise RuntimeError(
-            "ONEC_BASE_URL не задан. Укажите URL базы 1С, например: http://server/myapp"
-        )
-    return f"{ONEC_BASE_URL}/odata/standard.odata"
-
-
-def _client() -> httpx.AsyncClient:
-    auth = httpx.BasicAuth(ONEC_USERNAME, ONEC_PASSWORD) if ONEC_USERNAME else None
+def _make_client(
+    base_url: str,
+    login: str,
+    password: str,
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> httpx.AsyncClient:
+    odata_url = f"{base_url.rstrip('/')}/odata/standard.odata"
+    auth = httpx.BasicAuth(login, password) if login else None
     return httpx.AsyncClient(
-        base_url=_odata_url(),
+        base_url=odata_url,
         auth=auth,
         headers={
             "Accept": "application/json;odata.metadata=minimal",
             "OData-MaxVersion": "4.0",
             "Content-Type": "application/json",
         },
-        timeout=httpx.Timeout(60.0, connect=10.0),
+        verify=verify_ssl,
+        timeout=httpx.Timeout(float(timeout), connect=10.0),
     )
+
+
+def _env_client() -> httpx.AsyncClient:
+    """Клиент на основе env-переменных (fallback для локальной разработки)."""
+    if not _ENV_BASE_URL:
+        raise RuntimeError(
+            "ONEC_BASE_URL не задан. Укажите URL базы 1С или передайте credentials в запросе."
+        )
+    return _make_client(_ENV_BASE_URL, _ENV_USERNAME, _ENV_PASSWORD)
 
 
 def _handle(response: httpx.Response) -> Any:
@@ -69,16 +84,23 @@ def _extract_value(data: Any) -> Any:
     return data
 
 
-# ── XDTO type name mapping ─────────────────────────────────────────────────────
-
 # ── API Methods ────────────────────────────────────────────────────────────────
 
-async def get_metadata() -> dict[str, Any]:
+async def get_metadata(
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> dict[str, Any]:
     """
-    Получить метаданные базы 1С.
-    Возвращает списки каталогов, документов и других типов.
+    Получить метаданные базы 1С ($metadata).
     """
-    async with _client() as client:
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
         response = await client.get("/$metadata", headers={"Accept": "application/xml"})
     response.raise_for_status()
     xml_text = response.text
@@ -88,7 +110,6 @@ async def get_metadata() -> dict[str, Any]:
     except ET.ParseError as e:
         raise RuntimeError(f"Не удалось разобрать $metadata XML: {e}") from e
 
-    # Ищем EntityType элементы (могут быть в разных NS)
     entity_types: list[str] = []
     for elem in root.iter():
         local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
@@ -123,13 +144,22 @@ async def query(
     expand: Optional[str] = None,
     top: int = 20,
     skip: int = 0,
+    orderby: Optional[str] = None,
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
 ) -> list[dict]:
     """
     Запрос списка объектов через OData.
-    entity: OData имя типа, например Catalog_Номенклатура
-    filter: OData $filter выражение, например "Наименование eq 'Молоко'"
     """
-    params: dict[str, Any] = {"$top": top, "$skip": skip}
+    # $skip=0 заставляет 1C добавлять AUTOORDER, что ломает фильтры на ряде сущностей
+    params: dict[str, Any] = {"$top": top}
+    if skip:
+        params["$skip"] = skip
+    if orderby:
+        params["$orderby"] = orderby
     if filter:
         params["$filter"] = filter
     if select:
@@ -137,38 +167,74 @@ async def query(
     if expand:
         params["$expand"] = expand
 
-    async with _client() as client:
-        response = await client.get(f"/{entity}", params=params)
+    # 1С OData не принимает '+' (form encoding) — нужен '%20' (percent encoding)
+    qs = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
+        response = await client.get(f"/{entity}?{qs}")
     data = _handle(response)
     return _extract_value(data) or []
 
 
-async def get_one(entity: str, ref_id: str) -> dict[str, Any]:
-    """
-    Получить один объект по GUID.
-    """
-    # 1С OData: guid в формате guid'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+async def get_one(
+    entity: str,
+    ref_id: str,
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Получить один объект по GUID."""
     key = f"guid'{ref_id}'" if not ref_id.startswith("guid'") else ref_id
-    async with _client() as client:
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
         response = await client.get(f"/{entity}({key})")
     return _handle(response) or {}
 
 
-async def create(entity: str, data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Создать новый объект. POST /Entity.
-    """
-    async with _client() as client:
+async def create(
+    entity: str,
+    data: dict[str, Any],
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Создать новый объект. POST /Entity."""
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
         response = await client.post(f"/{entity}", json=data)
     return _handle(response) or {}
 
 
-async def update(entity: str, ref_id: str, data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Частичное обновление объекта. PATCH /Entity(guid'...').
-    """
+async def update(
+    entity: str,
+    ref_id: str,
+    data: dict[str, Any],
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Частичное обновление объекта. PATCH /Entity(guid'...')."""
     key = f"guid'{ref_id}'" if not ref_id.startswith("guid'") else ref_id
-    async with _client() as client:
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
         response = await client.patch(
             f"/{entity}({key})",
             json=data,
@@ -178,12 +244,22 @@ async def update(entity: str, ref_id: str, data: dict[str, Any]) -> dict[str, An
     return result or {"status": "updated", "ref_id": ref_id}
 
 
-async def delete(entity: str, ref_id: str) -> dict[str, Any]:
-    """
-    Удалить объект. DELETE /Entity(guid'...').
-    """
+async def delete(
+    entity: str,
+    ref_id: str,
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Удалить объект. DELETE /Entity(guid'...')."""
     key = f"guid'{ref_id}'" if not ref_id.startswith("guid'") else ref_id
-    async with _client() as client:
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
         response = await client.delete(
             f"/{entity}({key})",
             headers={"If-Match": "*"},
