@@ -669,26 +669,21 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
 # ── /logs endpoint (Starlette) ─────────────────────────────────────────────────
 
-def _logs_asgi_app():
-    """Возвращает ASGI-приложение для эндпоинта GET /logs."""
+async def _logs_handler(request: Any) -> Any:
+    """GET /logs — отдаёт последние N записей лога запросов."""
     from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
-
-    async def logs_endpoint(request: Request) -> Response:
-        # Проверка ключа: query string ?api_key=... или заголовок X-Api-Key
-        api_key = request.query_params.get("api_key") or request.headers.get("x-api-key", "")
-        if api_key != _LOG_API_KEY:
-            return JSONResponse({"error": "invalid api_key"}, status_code=401)
-        last_str = request.query_params.get("last", "")
-        last = int(last_str) if last_str.isdigit() else len(_request_log)
-        entries = list(_request_log)[-last:]
-        return JSONResponse(
-            {"count": len(entries), "total": len(_request_log), "logs": entries},
-            headers={"Access-Control-Allow-Origin": "*"},
-        )
-
-    from starlette.routing import Route
-    return logs_endpoint
+    from starlette.responses import JSONResponse
+    request = Request(request) if not hasattr(request, "query_params") else request
+    api_key = request.query_params.get("api_key") or request.headers.get("x-api-key", "")
+    if api_key != _LOG_API_KEY:
+        return JSONResponse({"error": "invalid api_key"}, status_code=401)
+    last_str = request.query_params.get("last", "")
+    last = int(last_str) if last_str.isdigit() else len(_request_log)
+    entries = list(_request_log)[-last:]
+    return JSONResponse(
+        {"count": len(entries), "total": len(_request_log), "logs": entries},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -712,19 +707,16 @@ def main() -> None:
 
     if transport == "streamable-http":
         import uvicorn
-        from starlette.applications import Starlette
-        from starlette.routing import Mount, Route
+        from starlette.routing import Route
 
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         # Railway задаёт PORT; MCP_PORT как явный override
         port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8001")
 
-        # Создаём объединённое приложение: /logs отдельным Route, всё остальное → MCP
+        # Добавляем /logs напрямую в роутер MCP-приложения (тот же процесс → тот же _request_log)
         mcp_app = mcp.streamable_http_app()
-        combined_app = Starlette(routes=[
-            Route("/logs", _logs_asgi_app()),
-            Mount("/", app=mcp_app),
-        ])
+        mcp_app.router.routes.append(Route("/logs", _logs_handler))
+        combined_app = mcp_app
 
         logger.info("MCP + /logs: http://%s:%d  (транспорт: streamable-http)", host, port)
 
