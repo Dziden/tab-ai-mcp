@@ -562,10 +562,11 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                          (time.monotonic() - t0) * 1000, rows=len(result))
             return result
         except Exception as exc:
+            err = str(exc)
             _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
-                         (time.monotonic() - t0) * 1000, error=str(exc))
-            raise
+                         (time.monotonic() - t0) * 1000, error=err)
+            return [{"_error": err, "_entity": resolved}]
 
     @mcp.tool()
     async def write_1c(
