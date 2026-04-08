@@ -323,8 +323,9 @@ async def _fetch_onec_credentials(organization: str, user_id: str) -> dict:
 
 _BASE_INSTRUCTIONS = (
     "MCP-коннектор к 1С:Предприятие (компонент tab_mcp архитектуры ТАБ:БИИ).\n\n"
-    "Три инструмента:\n"
-    "  read_1c              — читает данные из 1С через OData\n"
+    "Четыре инструмента:\n"
+    "  get_account_balance  — остатки по счетам бухучёта на дату (используй для вопросов про банк, кассу, долги)\n"
+    "  read_1c              — читает данные из 1С через OData (произвольные запросы)\n"
     "  write_1c             — записывает данные в 1С через OData (upsert)\n"
     "  count_document_marks — подсчёт печатей и подписей в документе\n\n"
     "read_1c и write_1c принимают параметр query: точное OData-имя ИЛИ описание "
@@ -614,6 +615,132 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             _log_request("write_1c", query, resolved, {"org": organization, "count": len(items)},
                          (time.monotonic() - t0) * 1000, error=str(exc))
             raise
+
+    @mcp.tool()
+    async def get_account_balance(
+        organization: str,
+        account_codes: list[str],
+        date: str,
+        register: str = "AccountingRegister_Хозрасчетный",
+        chart: str = "ChartOfAccounts_Хозрасчетный",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        """
+        Получить остатки по счетам бухгалтерского учёта на дату.
+        Get account balances on a date from 1C accounting register.
+
+        Автоматически выполняет полный алгоритм:
+          1. Для каждого кода счёта запрашивает Ref_Key из плана счетов
+          2. Для каждого Ref_Key запрашивает виртуальную таблицу /Balance(Period=...)
+          3. Возвращает итоговые суммы по каждому счёту и общий итог
+
+        Используй этот инструмент для вопросов:
+          «остаток по банку», «сколько денег на счете», «остаток по кассе»,
+          «задолженность покупателей», «задолженность поставщикам»,
+          «остаток по счету 51/52/60/62» и т.д.
+
+        Типичные группы счетов:
+          Банк:    ["51", "52", "55"]
+          Касса:   ["50"]
+          Дебиторы (покупатели):  ["62"]
+          Кредиторы (поставщики): ["60"]
+          Выручка: ["90.01"]
+          НДС:     ["68.02"]
+
+        Args:
+            organization:  Код организации (ключ в tab_ss). ОБЯЗАТЕЛЕН.
+            account_codes: Список кодов счетов, например ["51", "52", "55"] или ["62"].
+            date:          Дата в формате "YYYY-MM-DD", например "2025-12-31".
+            register:      OData-имя регистра бухгалтерии (по умолчанию Хозрасчетный).
+            chart:         OData-имя плана счетов (по умолчанию Хозрасчетный).
+            user_id:       ID пользователя (по умолчанию "").
+
+        Returns:
+            {
+              "date": "2025-12-31",
+              "accounts": [
+                {
+                  "code": "51",
+                  "ref_key": "guid'...'",
+                  "СуммаBalance": 1234567.89,
+                  "ВалютнаяСуммаBalance": 0,
+                  "rows": [...]   # сырые строки из Balance
+                },
+                ...
+              ],
+              "total_rub": 1234567.89,   # сумма СуммаBalance по всем счетам
+              "errors": []               # коды счетов, которые не удалось найти
+            }
+        """
+        conn = await _fetch_onec_credentials(organization, user_id)
+        base_url = conn["odata_base_url"]
+        login = conn["login"]
+        password = conn["password"]
+        verify_ssl = conn.get("verify_ssl", True)
+        timeout = conn.get("timeout_seconds", 120)
+
+        # Нормализуем дату: "2025-12-31" → "2025-12-31T00:00:00"
+        dt = date.strip()
+        if "T" not in dt:
+            dt = dt + "T00:00:00"
+
+        t0 = time.monotonic()
+        results = []
+        errors = []
+        total_rub = 0.0
+
+        for code in account_codes:
+            try:
+                # Шаг 1: получить Ref_Key счёта (ChartOfAccounts не поддерживает 'or')
+                chart_rows = await oc.query(
+                    chart,
+                    filter=f"Code eq '{code}'",
+                    select="Ref_Key,Code,Description",
+                    top=1,
+                    base_url=base_url, login=login, password=password,
+                    verify_ssl=verify_ssl, timeout=timeout,
+                )
+                if not chart_rows:
+                    errors.append({"code": code, "error": "счёт не найден в плане счетов"})
+                    continue
+
+                ref_key = chart_rows[0]["Ref_Key"]
+
+                # Шаг 2: запрос виртуальной таблицы Balance
+                balance_rows = await oc.query(
+                    f"{register}/Balance(Period=datetime'{dt}')",
+                    filter=f"Account_Key eq guid'{ref_key}'",
+                    base_url=base_url, login=login, password=password,
+                    verify_ssl=verify_ssl, timeout=timeout,
+                )
+
+                sum_rub = sum(float(r.get("СуммаBalance", 0) or 0) for r in balance_rows)
+                sum_val = sum(float(r.get("ВалютнаяСуммаBalance", 0) or 0) for r in balance_rows)
+                total_rub += sum_rub
+
+                results.append({
+                    "code": code,
+                    "description": chart_rows[0].get("Description", ""),
+                    "ref_key": ref_key,
+                    "СуммаBalance": sum_rub,
+                    "ВалютнаяСуммаBalance": sum_val,
+                    "rows": balance_rows,
+                })
+            except Exception as exc:
+                errors.append({"code": code, "error": str(exc)})
+
+        _log_request(
+            "get_account_balance", f"accounts={account_codes}", f"{register}/Balance",
+            {"org": organization, "date": date, "codes": account_codes},
+            (time.monotonic() - t0) * 1000,
+            rows=sum(len(r["rows"]) for r in results),
+        )
+        return {
+            "date": date,
+            "accounts": results,
+            "total_rub": total_rub,
+            "errors": errors,
+        }
 
     @mcp.tool()
     async def count_document_marks(
