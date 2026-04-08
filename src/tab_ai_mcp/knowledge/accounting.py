@@ -43,12 +43,35 @@ INSTRUCTIONS = """
   Платёжное поручение (вх): Document_ПлатёжноеПоручениеВходящее
   Платёжное поручение (исх): Document_ПлатёжноеПоручение
 
+Субконто (аналитика) в Balance/Turnovers:
+  Результаты Balance и Turnovers возвращают поля Субконто1_Key, Субконто2_Key, Субконто3_Key — это GUID-ссылки.
+  Чтобы показать НАЗВАНИЯ вместо ключей, есть два способа:
+
+  Способ A — expand (1С поддерживает для виртуальных таблиц):
+    rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'...')",
+                   filter="Account_Key eq guid'...'",
+                   expand="Субконто1,Субконто2")
+    После expand поля Субконто1.Description (или .Наименование) содержат читаемое имя.
+
+  Способ Б — отдельный lookup по Ref_Key:
+    Для счёта 51 (банк): Субконто1_Key → Catalog_БанковскиеСчета (поле НомерСчета или Description)
+    Для счёта 60/62 (контрагенты): Субконто1_Key → Catalog_Контрагенты (поле Description/Наименование)
+    Для счёта 10/41/43 (номенклатура): Субконто1_Key → Catalog_Номенклатура (поле Description)
+    Lookup: read_1c("Catalog_БанковскиеСчета", filter=f"Ref_Key eq guid'{key}'")
+
+  Субконто по счетам (типичная Бухгалтерия):
+    51 (Банк):      Субконто1 = Catalog_БанковскиеСчета, Субконто2 = Catalog_СтатьиДвиженияДенежныхСредств
+    60/62:          Субконто1 = Catalog_Контрагенты,     Субконто2 = Catalog_ДоговорыКонтрагентов
+    10/41/43:       Субконто1 = Catalog_Номенклатура,    Субконто2 = Catalog_Склады
+    68/69/70:       Субконто1 = Catalog_СотрудникиОрганизаций (или Catalog_Контрагенты)
+
 Алгоритм остатка по счёту на дату (два способа):
 
   Способ 1 — Virtual table Balance (рекомендуется):
     ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '51'")[0]["Ref_Key"]
     rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                   filter=f"Account_Key eq guid'{ref}'")
+                   filter=f"Account_Key eq guid'{ref}'",
+                   expand="Субконто1,Субконто2")   # ← expand для читаемых названий
     Остаток = СуммаBalance (или ВалютнаяСуммаBalance для валютных счетов)
 
   Способ 2 — через RecordType:
