@@ -105,18 +105,27 @@ INSTRUCTIONS = """
     RecordType возвращает отдельные проводки — суммировать вручную НЕВЕРНО (пропускаются сторно,
     корректировки, получается только часть данных).
 
+  ⚠ НИКОГДА не передавать код счёта ('90.01', '51' и т.д.) напрямую как guid!
+    ВСЕГДА сначала получать Ref_Key через ChartOfAccounts_Хозрасчетный:
+    ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'")[0]["Ref_Key"]
+    Затем: filter=f"Account_Key eq guid'{ref9001}'"  ← вот так, с реальным GUID
+
   Способ 1 — Virtual table Turnovers (рекомендуется):
-    ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'")[0]["Ref_Key"]
+    # Шаг 1 — получить Ref_Key (обязательно!):
+    ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'")[0]["Ref_Key"]
+    ref9002 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.02'")[0]["Ref_Key"]
+    # Шаг 2 — запросить обороты:
     rows = read_1c(
       "AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime'2025-01-01T00:00:00',EndPeriod=datetime'2025-12-31T00:00:00')",
-      filter=f"Account_Key eq guid'{ref}'"
+      filter=f"Account_Key eq guid'{ref9001}'"
     )
     Выручка = СуммаCrTurnover (кредитовый оборот по 90.01)
+    Себестоимость: аналогично с ref9002, поле СуммаDrTurnover
 
   Способ 2 — BalanceAndTurnovers (остатки + обороты за один запрос):
     read_1c(
       "AccountingRegister_Хозрасчетный/BalanceAndTurnovers(StartPeriod=datetime'...', EndPeriod=datetime'...')",
-      filter=f"Account_Key eq guid'{ref}'"
+      filter=f"Account_Key eq guid'{ref9001}'"
     )
     Поля: НачальныйОстатокДр, НачальныйОстатокКр, ОборотДр, ОборотКр, КонечныйОстатокДр, КонечныйОстатокКр
 
@@ -125,6 +134,13 @@ INSTRUCTIONS = """
     Себестоимость (90.02): СуммаDrTurnover
     НДС начисленный (90.03): СуммаDrTurnover
     Оплаты банк (51):     СуммаDrTurnover (поступления) / СуммаCrTurnover (списания)
+
+Договоры и периодический анализ:
+  Catalog_ДоговорыКонтрагентов — это справочник (не документ), у него НЕТ поля Дата/ДатаСоздания.
+  Фильтровать по дате нельзя. Для анализа активности за период используй документы:
+    Document_РеализацияТоваровУслуг — продажи (поле Дата)
+    Document_ПоступлениеТоваровУслуг — покупки (поле Дата)
+  Пример "сколько договоров использовалось в марте" = уникальный Договор_Key в реализациях за март.
 """
 
 PROMPTS = [
