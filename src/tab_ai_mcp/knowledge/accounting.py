@@ -122,21 +122,14 @@ INSTRUCTIONS = """
     Выручка = СуммаCrTurnover (кредитовый оборот по 90.01)
     Себестоимость: аналогично с ref9002, поле СуммаDrTurnover
 
-  ⚠ Если Turnovers для 90.01 возвращает 0 строк — проводки идут на субсчёт 90.01.1 (типично для ОСНО).
-    Попробовать последовательно: '90.01.1', '90.01.2'.
-    Если и субсчета возвращают 0 — использовать Способ 2 (документы реализации).
-
-  Способ 2 — через Document_РеализацияТоваровУслуг (когда Turnovers не работает):
-    ⚠ Фильтровать ВЕСЬ год, не один день! Использовать top=1000 для полноты данных.
-    rows_2024 = read_1c("Document_РеализацияТоваровУслуг",
-                        filter="Дата ge datetime'2024-01-01T00:00:00' and Дата le datetime'2024-12-31T23:59:59'",
-                        select="Дата,СуммаДокумента,Контрагент_Key",
-                        top=1000)
-    rows_2025 = read_1c("Document_РеализацияТоваровУслуг",
-                        filter="Дата ge datetime'2025-01-01T00:00:00' and Дата le datetime'2025-12-31T23:59:59'",
-                        select="Дата,СуммаДокумента,Контрагент_Key",
-                        top=1000)
-    Выручка = Σ СуммаДокумента. Группировать по месяцу из поля Дата.
+  ⚠ Если Turnovers для 90.01 возвращает 0 строк — проводки идут на субсчетах (90.01.1, 90.01.2 и т.д.).
+    В этом случае запросить родительский счёт 90 — он агрегирует все субсчета:
+    ref90 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90'")[0]["Ref_Key"]
+    rows = read_1c(
+      "AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime'...', EndPeriod=datetime'...')",
+      filter=f"Account_Key eq guid'{ref90}'"
+    )
+    Выручка = СуммаCrTurnover по счёту 90 (включает 90.01, 90.01.1, 90.01.2 и т.д.)
 
   Способ 2 — BalanceAndTurnovers (остатки + обороты за один запрос):
     read_1c(
@@ -214,12 +207,16 @@ PROMPTS = [
             "  ref9001 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.01'\")[0]['Ref_Key']\n"
             "  ref9002 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.02'\")[0]['Ref_Key']\n\n"
             "Шаг 2. Запроси обороты через Turnovers:\n"
-            "  read_1c(\n"
+            "  rows_rev = read_1c(\n"
             "    'AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime\\'{date_from}T00:00:00\\',EndPeriod=datetime\\'{date_to}T00:00:00\\')',\n"
             "    filter=f\"Account_Key eq guid'{{ref9001}}'\"\n"
             "  )\n"
             "  Выручка = поле СуммаCrTurnover\n\n"
-            "  read_1c(...Turnovers..., filter=f\"Account_Key eq guid'{{ref9002}}'\"\n"
+            "  ⚠ Если rows_rev пустой (0 строк) — проводки идут на субсчетах.\n"
+            "  Тогда запросить родительский счёт 90 (агрегирует все субсчета 90.01.x):\n"
+            "  ref90 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90'\")[0]['Ref_Key']\n"
+            "  rows_rev = read_1c(...Turnovers..., filter=f\"Account_Key eq guid'{{ref90}}'\")\n\n"
+            "  rows_cost = read_1c(...Turnovers..., filter=f\"Account_Key eq guid'{{ref9002}}'\"\n"
             "  Себестоимость = поле СуммаDrTurnover\n\n"
             "Шаг 3. Валовая прибыль = Выручка - Себестоимость."
         ),
