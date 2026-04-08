@@ -686,21 +686,16 @@ class _McpCompatMiddleware:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             scope = dict(scope)
-            new_headers = []
-            for k, v in scope.get("headers", []):
-                kl = k.lower()
-                if kl == b"host":
-                    new_headers.append((b"host", self._fake_host))
-                elif kl == b"accept":
-                    if b"text/event-stream" not in v:
-                        v = v + b", text/event-stream"
-                    new_headers.append((k, v))
-                else:
-                    new_headers.append((k, v))
-            # Если Accept не было в запросе — добавляем
-            if not any(k.lower() == b"accept" for k, _ in scope.get("headers", [])):
-                new_headers.append((b"accept", b"application/json, text/event-stream"))
-            scope["headers"] = new_headers
+            # Принудительно заменяем Host и Accept — убираем старые значения,
+            # ставим нужные. Host → localhost:PORT (DNS rebinding protection),
+            # Accept → application/json (json_response=True mode, без SSE).
+            scope["headers"] = [
+                (k, v) for k, v in scope.get("headers", [])
+                if k.lower() not in (b"host", b"accept")
+            ] + [
+                (b"host", self._fake_host),
+                (b"accept", b"application/json"),
+            ]
         await self.app(scope, receive, send)
 
 
