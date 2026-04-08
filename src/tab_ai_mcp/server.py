@@ -688,8 +688,7 @@ def _logs_asgi_app():
         )
 
     from starlette.routing import Route
-    from starlette.applications import Starlette
-    return Starlette(routes=[Route("/logs", logs_endpoint)])
+    return logs_endpoint
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -714,22 +713,25 @@ def main() -> None:
     if transport == "streamable-http":
         import uvicorn
         from starlette.applications import Starlette
-        from starlette.routing import Mount
+        from starlette.routing import Mount, Route
 
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         # Railway задаёт PORT; MCP_PORT как явный override
         port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8001")
 
-        # Монтируем /logs в тот же Starlette app что и MCP
+        # Создаём объединённое приложение: /logs отдельным Route, всё остальное → MCP
         mcp_app = mcp.streamable_http_app()
-        mcp_app.mount("/", app=_logs_asgi_app())
+        combined_app = Starlette(routes=[
+            Route("/logs", _logs_asgi_app()),
+            Mount("/", app=mcp_app),
+        ])
 
         logger.info("MCP + /logs: http://%s:%d  (транспорт: streamable-http)", host, port)
 
         async def _run_all() -> None:
             await asyncio.gather(
                 _index_metadata(),
-                uvicorn.Server(uvicorn.Config(mcp_app, host=host, port=port, log_level="warning")).serve(),
+                uvicorn.Server(uvicorn.Config(combined_app, host=host, port=port, log_level="warning")).serve(),
             )
         asyncio.run(_run_all())
     else:
