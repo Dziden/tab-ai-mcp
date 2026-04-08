@@ -723,6 +723,35 @@ async def _logs_handler(request: Any) -> Any:
     )
 
 
+def _patch_json_response(starlette_app: Any) -> None:
+    """Патчит session_manager.json_response=True в Starlette-приложении FastMCP.
+
+    Когда streamable_http_app() не поддерживает json_response=True (старый API),
+    находим StreamableHTTPSessionManager в роутах и патчим его напрямую.
+    Без этого FastMCP требует Accept: text/event-stream → 406 для клиентов без SSE.
+    """
+    try:
+        for route in getattr(starlette_app, "routes", []):
+            endpoint = getattr(route, "endpoint", None) or getattr(route, "app", None)
+            if endpoint is None:
+                continue
+            sm = getattr(endpoint, "session_manager", None)
+            if sm is not None and not getattr(sm, "json_response", True):
+                sm.json_response = True
+                logger.info("Patched session_manager.json_response=True")
+                return
+            # Иногда endpoint обёрнут в Mount или другой объект
+            inner = getattr(endpoint, "app", None)
+            if inner is not None:
+                sm = getattr(inner, "session_manager", None)
+                if sm is not None and not getattr(sm, "json_response", True):
+                    sm.json_response = True
+                    logger.info("Patched inner session_manager.json_response=True")
+                    return
+    except Exception as exc:
+        logger.warning("_patch_json_response: %s", exc)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -767,6 +796,12 @@ def main() -> None:
                     mcp_app = mcp.streamable_http_app(json_response=True)
                 except TypeError:
                     mcp_app = mcp.streamable_http_app()
+
+        # Если json_response не поддержан через API — патчим session_manager напрямую.
+        # StreamableHTTPSessionManager.json_response управляет is_json_response_enabled
+        # в каждом новом транспорте; без этого FastMCP требует Accept: text/event-stream.
+        _patch_json_response(mcp_app)
+
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         # Оборачиваем в middleware для обхода DNS rebinding protection
         # allowed_hosts = ["localhost:*"] — нужен порт в Host заголовке
