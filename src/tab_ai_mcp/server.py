@@ -742,13 +742,19 @@ def main() -> None:
         # автоматически включает защиту и блокирует все внешние хосты с 421).
         # stateless_http=True — каждый запрос независим, без session handshake.
         # Оба параметра появились в разных версиях mcp — используем try/except.
+        # json_response=True — возвращает JSON вместо SSE-стрима.
+        # Без этого клиент обязан слать Accept: text/event-stream (tab_ss не шлёт → 406).
+        # stateless_http=True — каждый запрос независим, без session handshake.
         try:
-            mcp_app = mcp.streamable_http_app(stateless_http=True, host=host)
+            mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True, host=host)
         except TypeError:
             try:
-                mcp_app = mcp.streamable_http_app(host=host)
+                mcp_app = mcp.streamable_http_app(json_response=True, host=host)
             except TypeError:
-                mcp_app = mcp.streamable_http_app()
+                try:
+                    mcp_app = mcp.streamable_http_app(json_response=True)
+                except TypeError:
+                    mcp_app = mcp.streamable_http_app()
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         # Оборачиваем в middleware для обхода DNS rebinding protection
         # allowed_hosts = ["localhost:*"] — нужен порт в Host заголовке
