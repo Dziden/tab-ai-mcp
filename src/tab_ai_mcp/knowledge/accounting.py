@@ -65,26 +65,39 @@ INSTRUCTIONS = """
     10/41/43:       Субконто1 = Catalog_Номенклатура,    Субконто2 = Catalog_Склады
     68/69/70:       Субконто1 = Catalog_СотрудникиОрганизаций (или Catalog_Контрагенты)
 
-Алгоритм остатка по счёту на дату (два способа):
+⚠ ОСТАТОК ПО БАНКУ — запрашивать ВСЕ ТРИ счёта: 51, 52, 55 (НЕ только 51!):
 
-  Способ 1 — Virtual table Balance (рекомендуется):
-    ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '51'")[0]["Ref_Key"]
-    rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                   filter=f"Account_Key eq guid'{ref}'",
-                   expand="Субконто1,Субконто2")   # ← expand для читаемых названий
-    Остаток = СуммаBalance (или ВалютнаяСуммаBalance для валютных счетов)
+  Шаг 1. Для каждого счёта — ОТДЕЛЬНЫЙ запрос (ChartOfAccounts не поддерживает 'or'!):
+    ref51 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '51'")[0]["Ref_Key"]
+    ref52 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '52'")[0]["Ref_Key"]
+    ref55 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '55'")[0]["Ref_Key"]
 
-  Способ 2 — через RecordType:
-    rows = read_1c("AccountingRegister_Хозрасчетный_RecordType",
-                   filter=f"AccountDr_Key eq guid'{ref}' and Period le datetime'...'")
-    Остаток = Σ Сумма (Дт) - Σ Сумма (Кт)
+  Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
+    rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
+                     filter=f"Account_Key eq guid'{ref51}'", expand="Субконто1")
+    rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
+                     filter=f"Account_Key eq guid'{ref52}'", expand="Субконто1")
+    rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
+                     filter=f"Account_Key eq guid'{ref55}'", expand="Субконто1")
+
+  Шаг 3. Итог:
+    Рублёвый остаток = Σ СуммаBalance по rows51 + rows55
+    Валютный остаток = rows52 сгруппировать по Валюта_Key → ВалютнаяСуммаBalance по каждой валюте
 
   Важно: ChartOfAccounts НЕ поддерживает 'or' в filter — делать отдельный запрос для каждого счета.
   Пример: Code eq '51' — работает. Code eq '51' or Code eq '52' — НЕ работает (500 ошибка).
 
+Алгоритм остатка по произвольному счёту на дату:
+
+  ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq 'XX'")[0]["Ref_Key"]
+  rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
+                 filter=f"Account_Key eq guid'{ref}'",
+                 expand="Субконто1,Субконто2")
+  Остаток = СуммаBalance
+
   Активный счёт (01,04,10,19,41,43,50,51,52,55,58,60.02,62): остаток = Д - К
   Пассивный (60,62.02,66,67,68,69,70,80,83,84): остаток = К - Д
-  Для валютных (52): использовать ВалютнаяСуммаBalance/ВалютнаяСуммаDr/Cr, группировать по Валюта_Key.
+  Для валютных (52): ВалютнаяСуммаBalance, группировать по Валюта_Key.
 
 Алгоритм оборотов/выручки за период:
 

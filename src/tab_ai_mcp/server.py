@@ -504,20 +504,24 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                              "список контрагентов"
 
                           ═══ ОСТАТКИ ПО БАНКУ — ПОШАГОВЫЙ АЛГОРИТМ ════════════
-                          Шаг 1. Получить Ref_Key для каждого счёта отдельно
-                                 (ChartOfAccounts НЕ поддерживает 'or' в filter!):
-                            ref51 = read_1c(org, "ChartOfAccounts_Хозрасчетный",
+                          ⚠ Запрашивать ВСЕ ТРИ счёта: 51, 52, 55 — НЕ только 51!
+                          Шаг 1. Ref_Key каждого счёта — ОТДЕЛЬНЫЙ запрос:
+                            ref51 = read_1c("ChartOfAccounts_Хозрасчетный",
                                             filter="Code eq '51'")[0]["Ref_Key"]
-                            ref52 = read_1c(org, "ChartOfAccounts_Хозрасчетный",
+                            ref52 = read_1c("ChartOfAccounts_Хозрасчетный",
                                             filter="Code eq '52'")[0]["Ref_Key"]
-                            ref55 = read_1c(org, "ChartOfAccounts_Хозрасчетный",
+                            ref55 = read_1c("ChartOfAccounts_Хозрасчетный",
                                             filter="Code eq '55'")[0]["Ref_Key"]
-                          Шаг 2. Запросить Balance для каждого счёта:
-                            read_1c(org,
-                              "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')",
-                              filter="Account_Key eq guid'<ref51>'")
-                            → поле СуммаBalance = рублёвый остаток (51, 55)
-                            → поле ВалютнаяСуммаBalance = валютный остаток (52)
+                          Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
+                            rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
+                                             filter="Account_Key eq guid'<ref51>'", expand="Субконто1")
+                            rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
+                                             filter="Account_Key eq guid'<ref52>'", expand="Субконто1")
+                            rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
+                                             filter="Account_Key eq guid'<ref55>'", expand="Субконто1")
+                          Шаг 3. Итог:
+                            Рублёвый = Σ СуммаBalance (rows51 + rows55)
+                            Валютный = rows52 по Валюта_Key → ВалютнаяСуммаBalance каждой валюты
                           ═══════════════════════════════════════════════════════
 
             user_id:          ID пользователя (по умолчанию "").
