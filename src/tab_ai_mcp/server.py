@@ -430,13 +430,7 @@ async def _index_metadata() -> None:
 # ── Сборка MCP сервера ─────────────────────────────────────────────────────────
 
 def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
-    # stateless_http=True — каждый запрос независим, без session handshake.
-    # Нужно для клиентов (tab_ss), которые не реализуют полный MCP session protocol.
-    # Без этого FastMCP возвращает 421 Misdirected Request при отсутствии Mcp-Session-Id.
-    try:
-        mcp = FastMCP(name="tab-mcp", instructions=instructions, stateless_http=True)
-    except TypeError:
-        mcp = FastMCP(name="tab-mcp", instructions=instructions)
+    mcp = FastMCP(name="tab-mcp", instructions=instructions)
 
     # Регистрируем типовые промпты из knowledge-файла
     for p in prompts:
@@ -719,7 +713,10 @@ def main() -> None:
         # Railway задаёт PORT; MCP_PORT как явный override
         port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8001")
 
-        mcp_app = mcp.streamable_http_app()
+        # stateless_http=True — каждый запрос независим, без session handshake.
+        # host="0.0.0.0" — отключает DNS rebinding protection (default host=127.0.0.1
+        # автоматически включает защиту и блокирует все внешние хосты с 421).
+        mcp_app = mcp.streamable_http_app(stateless_http=True, host=host)
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         combined_app = mcp_app
 
