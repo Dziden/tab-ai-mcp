@@ -347,6 +347,10 @@ _BASE_INSTRUCTIONS = (
 
 # ── Старт: определение конфигурации + индексация метаданных ───────────────────
 
+def _today_prefix() -> str:
+    return f"Сегодня: {datetime.now(timezone.utc).strftime('%Y-%m-%d')} (UTC).\n\n"
+
+
 async def _load_instructions() -> tuple[str, list[dict]]:
     """Определить конфигурацию 1С и вернуть (instructions, prompts)."""
     try:
@@ -360,7 +364,7 @@ async def _load_instructions() -> tuple[str, list[dict]]:
         detected = config_detector.detect(all_types)
         knowledge = KNOWLEDGE_MAP.get(detected.name)
 
-        instructions = _BASE_INSTRUCTIONS + f"Конфигурация: {detected.name}\n"
+        instructions = _BASE_INSTRUCTIONS + _today_prefix() + f"Конфигурация: {detected.name}\n"
         prompts: list[dict] = []
         if knowledge:
             instructions += knowledge.INSTRUCTIONS
@@ -372,7 +376,7 @@ async def _load_instructions() -> tuple[str, list[dict]]:
     except Exception as exc:
         logger.warning("Не удалось определить конфигурацию: %s — загружаю знания Бухгалтерии по умолчанию", exc)
         from tab_ai_mcp.knowledge import accounting
-        return _BASE_INSTRUCTIONS + accounting.INSTRUCTIONS, accounting.PROMPTS
+        return _BASE_INSTRUCTIONS + _today_prefix() + accounting.INSTRUCTIONS, accounting.PROMPTS
 
 
 async def _index_metadata() -> None:
@@ -542,9 +546,15 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             }
         else:
             conn = await _fetch_onec_credentials(organization, user_id)
+        # Снять prefix "user: " / "assistant: " если tab_ss передаёт сырое сообщение
+        clean_query = query
+        for _pfx in ("user:", "assistant:", "system:"):
+            if query.lower().startswith(_pfx):
+                clean_query = query[len(_pfx):].strip()
+                break
         resolved = (
-            query if _looks_like_odata_name(query) or "/" in query
-            else await _resolve_entity_type(query, model=model, organization=organization, user_id=user_id)
+            clean_query if _looks_like_odata_name(clean_query) or "/" in clean_query
+            else await _resolve_entity_type(clean_query, model=model, organization=organization, user_id=user_id)
         )
         resolved = _normalize_entity_for_read(resolved)
         t0 = time.monotonic()

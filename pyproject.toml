@@ -1,6 +1,6 @@
 [project]
 name = "tab-ai-mcp"
-version = "0.4.15"
+version = "0.4.16"
 description = "MCP-сервер для 1С: семантический поиск, CRUD через OData, обогащение объектов по EnterpriseData схеме"
 license = { text = "MIT" }
 authors = [
