@@ -284,6 +284,9 @@ async def _fetch_onec_credentials(organization: str, user_id: str) -> dict:
     Fallback: если tab_ss недоступен и заданы ONEC_BASE_URL/ONEC_USERNAME/ONEC_PASSWORD
     в env — использовать их (для локальной разработки и обратной совместимости).
     """
+    # Если organization не передана — берём из ONEC_ORGANIZATION env (дефолт для одноорганизационных сценариев)
+    if not organization:
+        organization = os.environ.get("ONEC_ORGANIZATION") or os.environ.get("TAB_SS_ORGANIZATION") or organization
     cache_key = (organization, user_id)
     cached, ts = _CONN_CACHE.get(cache_key, ({}, 0.0))
     if cached and (time.monotonic() - ts) < _CONN_CACHE_TTL:
@@ -360,7 +363,9 @@ async def _load_instructions() -> tuple[str, list[dict]]:
         detected = config_detector.detect(all_types)
         knowledge = KNOWLEDGE_MAP.get(detected.name)
 
-        instructions = _BASE_INSTRUCTIONS + f"Конфигурация: {detected.name}\n"
+        default_org = os.environ.get("ONEC_ORGANIZATION") or os.environ.get("TAB_SS_ORGANIZATION") or ""
+        org_hint = f"Организация по умолчанию (organization): \"{default_org}\"\n" if default_org else ""
+        instructions = _BASE_INSTRUCTIONS + org_hint + f"Конфигурация: {detected.name}\n"
         prompts: list[dict] = []
         if knowledge:
             instructions += knowledge.INSTRUCTIONS
@@ -371,7 +376,9 @@ async def _load_instructions() -> tuple[str, list[dict]]:
 
     except Exception as exc:
         logger.warning("Не удалось определить конфигурацию: %s", exc)
-        return _BASE_INSTRUCTIONS, []
+        default_org = os.environ.get("ONEC_ORGANIZATION") or os.environ.get("TAB_SS_ORGANIZATION") or ""
+        org_hint = f"Организация по умолчанию (organization): \"{default_org}\"\n" if default_org else ""
+        return _BASE_INSTRUCTIONS + org_hint, []
 
 
 async def _index_metadata() -> None:
