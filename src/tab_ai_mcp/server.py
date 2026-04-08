@@ -5,7 +5,7 @@ tab_mcp — MCP-коннектор к 1С:Предприятие
 
   read_1c              — чтение данных из 1С через OData
   write_1c             — запись данных в 1С через OData (upsert)
-  search_1c_metadata   — семантический поиск по метаданным 1С через tab_ss
+  count_document_marks — подсчёт печатей и подписей в документе
 
 При старте:
   1. Определяет конфигурацию 1С (Бухгалтерия, УНФ, ERP, ЗУП и др.)
@@ -13,17 +13,18 @@ tab_mcp — MCP-коннектор к 1С:Предприятие
   3. Индексирует метаданные 1С в tab_ss для семантического поиска
 
 Конфигурация (переменные окружения):
+  TAB_SS_URL     — URL сервиса tab_ss (credentials 1С + семантический поиск)
+  TAB_SS_API_KEY — Ключ доступа к tab_ss (заголовок X-Admin-Key)
+  ONEC_ORGANIZATION — организация для индексации метаданных OData в tab_ss
+  MCP_TRANSPORT  — stdio (по умолчанию) | streamable-http
+  MCP_HOST       — адрес для HTTP транспорта (по умолчанию 0.0.0.0)
+  PORT / MCP_PORT — порт для HTTP транспорта (Railway задаёт PORT автоматически)
+  LOG_API_KEY    — ключ для /logs эндпоинта (по умолчанию = TAB_SS_API_KEY)
+
+  Fallback для локальной разработки (если tab_ss недоступен):
   ONEC_BASE_URL  — URL базы 1С, например http://server/myapp
   ONEC_USERNAME  — Логин 1С
   ONEC_PASSWORD  — Пароль 1С
-  TAB_SS_URL     — URL сервиса tab_ss (semantic search / LLM service)
-  TAB_SS_API_KEY — Ключ доступа к tab_ss (заголовок X-Admin-Key)
-  ONEC_ORGANIZATION — организация в tab_ss; если задана, ею же помечается индекс метаданных
-  TAB_SS_USER_ID / ONEC_USER_ID — опционально, для поиска с разрезом по пользователю
-  TAB_SS_MODEL   — Модель для семантического поиска (по умолчанию: openai)
-  MCP_TRANSPORT  — stdio (по умолчанию) | streamable-http
-  MCP_HOST       — адрес для HTTP транспорта (по умолчанию 0.0.0.0)
-  MCP_PORT       — порт для HTTP транспорта (по умолчанию 8001)
 """
 
 from __future__ import annotations
@@ -322,26 +323,25 @@ async def _fetch_onec_credentials(organization: str, user_id: str) -> dict:
 
 _BASE_INSTRUCTIONS = (
     "MCP-коннектор к 1С:Предприятие (компонент tab_mcp архитектуры ТАБ:БИИ).\n\n"
-    "Два инструмента:\n"
-    "  read_1c  — читает данные из 1С через OData\n"
-    "  write_1c — записывает данные в 1С через OData (upsert)\n\n"
-    "Оба инструмента принимают entity_type как точное OData-имя ИЛИ описание "
+    "Три инструмента:\n"
+    "  read_1c              — читает данные из 1С через OData\n"
+    "  write_1c             — записывает данные в 1С через OData (upsert)\n"
+    "  count_document_marks — подсчёт печатей и подписей в документе\n\n"
+    "read_1c и write_1c принимают параметр query: точное OData-имя ИЛИ описание "
     "на естественном языке — во втором случае автоматически находят нужный тип.\n\n"
-    "Примеры:\n"
-    "  read_1c('Catalog_Номенклатура')       — точное имя\n"
-    "  read_1c('остатки товаров на складе')  — описание, резолвится автоматически\n\n"
+    "Примеры query:\n"
+    "  'Catalog_Номенклатура'       — точное OData-имя\n"
+    "  'остатки товаров на складе'  — описание, резолвится автоматически\n"
+    "  'AccountingRegister_Хозрасчетный/Balance(Period=datetime\\'2025-12-31T00:00:00\\')'  — виртуальная таблица\n\n"
     "Имена OData типов: Catalog_*, Document_*, AccumulationRegister_*, "
     "AccountingRegister_*, ChartOfAccounts_* и др.\n\n"
-    "Виртуальные таблицы (bound functions) для регистров:\n"
+    "Виртуальные таблицы для регистров (передавать в query напрямую):\n"
     "  AccumulationRegister_X/Balance(Period=...) — остатки на дату\n"
     "  AccumulationRegister_X/Turnovers(StartPeriod=..., EndPeriod=...) — обороты\n"
-    "  AccountingRegister_X/Balance(Period=...) — остатки по счетам\n"
+    "  AccountingRegister_X/Balance(Period=...) — остатки по счетам бухучёта\n"
     "  AccountingRegister_X/Turnovers(StartPeriod=..., EndPeriod=...) — обороты\n"
-    "  AccountingRegister_X/BalanceAndTurnovers(...) — остатки и обороты\n"
-    "Пример: read_1c('AccountingRegister_Хозрасчетный/Balance(Period=datetime\\'2024-12-31T00:00:00\\')')\n"
-    "  с filter='Account_Key eq guid\\'xxx...\\''\n\n"
-    "AccountingRegister_X без суффикса автоматически заменяется на _RecordType для "
-    "получения плоских записей (без группировки по документу).\n"
+    "AccountingRegister_X без суффикса автоматически заменяется на _RecordType "
+    "(плоские проводки). Для остатков всегда используй /Balance(Period=...).\n"
 )
 
 
