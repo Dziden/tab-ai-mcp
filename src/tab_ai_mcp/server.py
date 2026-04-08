@@ -669,13 +669,14 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
 # ── ASGI middleware: обход DNS rebinding protection ────────────────────────────
 
-class _LocalhostHostMiddleware:
-    """Переписывает Host → localhost:PORT перед передачей в FastMCP.
+class _McpCompatMiddleware:
+    """ASGI middleware для совместимости FastMCP с внешними клиентами.
 
-    FastMCP по умолчанию включает DNS rebinding protection и отклоняет
-    запросы с Host != localhost с кодом 421 "Invalid Host header".
-    allowed_hosts = ["localhost:*", "127.0.0.1:*"] — нужен порт в заголовке.
-    Этот middleware позволяет работать за Railway CDN и внутренней сетью.
+    Исправляет два ограничения FastMCP:
+    1. Host → localhost:PORT: FastMCP включает DNS rebinding protection и
+       отклоняет внешние Host-заголовки с 421 "Invalid Host header".
+    2. Accept: добавляет text/event-stream если его нет — FastMCP требует его
+       для SSE режима, а внешние клиенты (tab_ss) могут его не слать → 406.
     """
 
     def __init__(self, app: Any, port: int = 8080) -> None:
@@ -685,10 +686,21 @@ class _LocalhostHostMiddleware:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             scope = dict(scope)
-            scope["headers"] = [
-                (b"host", self._fake_host) if k.lower() == b"host" else (k, v)
-                for k, v in scope.get("headers", [])
-            ]
+            new_headers = []
+            for k, v in scope.get("headers", []):
+                kl = k.lower()
+                if kl == b"host":
+                    new_headers.append((b"host", self._fake_host))
+                elif kl == b"accept":
+                    if b"text/event-stream" not in v:
+                        v = v + b", text/event-stream"
+                    new_headers.append((k, v))
+                else:
+                    new_headers.append((k, v))
+            # Если Accept не было в запросе — добавляем
+            if not any(k.lower() == b"accept" for k, _ in scope.get("headers", [])):
+                new_headers.append((b"accept", b"application/json, text/event-stream"))
+            scope["headers"] = new_headers
         await self.app(scope, receive, send)
 
 
@@ -758,7 +770,7 @@ def main() -> None:
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         # Оборачиваем в middleware для обхода DNS rebinding protection
         # allowed_hosts = ["localhost:*"] — нужен порт в Host заголовке
-        combined_app = _LocalhostHostMiddleware(mcp_app, port=port)
+        combined_app = _McpCompatMiddleware(mcp_app, port=port)
 
         logger.info("MCP + /logs: http://%s:%d  (транспорт: streamable-http)", host, port)
 
