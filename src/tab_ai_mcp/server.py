@@ -670,21 +670,23 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 # ── ASGI middleware: обход DNS rebinding protection ────────────────────────────
 
 class _LocalhostHostMiddleware:
-    """Переписывает Host → localhost перед передачей в FastMCP.
+    """Переписывает Host → localhost:PORT перед передачей в FastMCP.
 
     FastMCP по умолчанию включает DNS rebinding protection и отклоняет
     запросы с Host != localhost с кодом 421 "Invalid Host header".
+    allowed_hosts = ["localhost:*", "127.0.0.1:*"] — нужен порт в заголовке.
     Этот middleware позволяет работать за Railway CDN и внутренней сетью.
     """
 
-    def __init__(self, app: Any) -> None:
+    def __init__(self, app: Any, port: int = 8080) -> None:
         self.app = app
+        self._fake_host = f"localhost:{port}".encode()
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             scope = dict(scope)
             scope["headers"] = [
-                (b"host", b"localhost") if k.lower() == b"host" else (k, v)
+                (b"host", self._fake_host) if k.lower() == b"host" else (k, v)
                 for k, v in scope.get("headers", [])
             ]
         await self.app(scope, receive, send)
@@ -749,7 +751,8 @@ def main() -> None:
                 mcp_app = mcp.streamable_http_app()
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         # Оборачиваем в middleware для обхода DNS rebinding protection
-        combined_app = _LocalhostHostMiddleware(mcp_app)
+        # allowed_hosts = ["localhost:*"] — нужен порт в Host заголовке
+        combined_app = _LocalhostHostMiddleware(mcp_app, port=port)
 
         logger.info("MCP + /logs: http://%s:%d  (транспорт: streamable-http)", host, port)
 
