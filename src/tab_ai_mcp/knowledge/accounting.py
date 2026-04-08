@@ -52,6 +52,33 @@ INSTRUCTIONS = """
   Активный счёт (01,04,10,19,41,43,50,51,52,55,58,60.02,62): остаток = Д - К
   Пассивный (60,62.02,66,67,68,69,70,80,83,84): остаток = К - Д
   Для валютных (52): использовать ВалютнаяСуммаBalance/ВалютнаяСуммаDr/Cr, группировать по Валюта_Key.
+
+Алгоритм оборотов/выручки за период:
+
+  ⚠ НЕ использовать AccountingRegister_Хозрасчетный_RecordType для расчёта выручки/оборотов!
+    RecordType возвращает отдельные проводки — суммировать вручную НЕВЕРНО (пропускаются сторно,
+    корректировки, получается только часть данных).
+
+  Способ 1 — Virtual table Turnovers (рекомендуется):
+    ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'")[0]["Ref_Key"]
+    rows = read_1c(
+      "AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime'2025-01-01T00:00:00',EndPeriod=datetime'2025-12-31T00:00:00')",
+      filter=f"Account_Key eq guid'{ref}'"
+    )
+    Выручка = СуммаCrTurnover (кредитовый оборот по 90.01)
+
+  Способ 2 — BalanceAndTurnovers (остатки + обороты за один запрос):
+    read_1c(
+      "AccountingRegister_Хозрасчетный/BalanceAndTurnovers(StartPeriod=datetime'...', EndPeriod=datetime'...')",
+      filter=f"Account_Key eq guid'{ref}'"
+    )
+    Поля: НачальныйОстатокДр, НачальныйОстатокКр, ОборотДр, ОборотКр, КонечныйОстатокДр, КонечныйОстатокКр
+
+  Типичные запросы оборотов:
+    Выручка (90.01):      СуммаCrTurnover
+    Себестоимость (90.02): СуммаDrTurnover
+    НДС начисленный (90.03): СуммаDrTurnover
+    Оплаты банк (51):     СуммаDrTurnover (поступления) / СуммаCrTurnover (списания)
 """
 
 PROMPTS = [
@@ -97,11 +124,19 @@ PROMPTS = [
         "description": "Выручка и себестоимость за период",
         "template": (
             "Рассчитай выручку и себестоимость за период с {date_from} по {date_to}.\n\n"
-            "1. Выручка (90.01): Кредит по AccountingRegister_Хозрасчетный_RecordType, "
-            "Period >= {date_from}, Period <= {date_to}.\n"
-            "2. Себестоимость (90.02): Дебет за тот же период.\n"
-            "3. Валовая прибыль = Выручка - Себестоимость.\n"
-            "4. НДС начисленный (90.03): Дебет за период."
+            "⚠ Не используй RecordType — только виртуальную таблицу Turnovers!\n\n"
+            "Шаг 1. Получи Ref_Key счётов (каждый счёт — отдельный запрос, 'or' не работает):\n"
+            "  ref9001 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.01'\")[0]['Ref_Key']\n"
+            "  ref9002 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.02'\")[0]['Ref_Key']\n\n"
+            "Шаг 2. Запроси обороты через Turnovers:\n"
+            "  read_1c(\n"
+            "    'AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime\\'{date_from}T00:00:00\\',EndPeriod=datetime\\'{date_to}T00:00:00\\')',\n"
+            "    filter=f\"Account_Key eq guid'{{ref9001}}'\"\n"
+            "  )\n"
+            "  Выручка = поле СуммаCrTurnover\n\n"
+            "  read_1c(...Turnovers..., filter=f\"Account_Key eq guid'{{ref9002}}'\"\n"
+            "  Себестоимость = поле СуммаDrTurnover\n\n"
+            "Шаг 3. Валовая прибыль = Выручка - Себестоимость."
         ),
     },
     {
