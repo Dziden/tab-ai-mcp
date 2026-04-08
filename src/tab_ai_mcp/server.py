@@ -715,7 +715,11 @@ def main() -> None:
 
         # stateless_http=True — каждый запрос независим, без session handshake
         # Нужно для клиентов которые не реализуют полный MCP session protocol
-        mcp_app = mcp.streamable_http_app(stateless_http=True)
+        # Поддерживается в mcp >= 1.3.0; fallback для более старых версий
+        try:
+            mcp_app = mcp.streamable_http_app(stateless_http=True)
+        except TypeError:
+            mcp_app = mcp.streamable_http_app()
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         combined_app = mcp_app
 
