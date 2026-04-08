@@ -468,7 +468,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         password: Optional[str] = None,
         verify_ssl: bool = True,
         timeout_seconds: int = 120,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """
         Прочитать данные из 1С через OData.
         Read data from 1C via OData.
@@ -530,7 +530,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             timeout_seconds:  Таймаут запроса в секундах (по умолчанию 120).
 
         Returns:
-            Список объектов в формате JSON.
+            {"value": [...]} — список объектов; при ошибке {"value": [], "_error": "...", "_entity": "..."}.
         """
         if odata_base_url:
             conn = {
@@ -560,13 +560,13 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, rows=len(result))
-            return result
+            return {"value": result}
         except Exception as exc:
             err = str(exc)
             _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, error=err)
-            return [{"_error": err, "_entity": resolved}]
+            return {"value": [], "_error": err, "_entity": resolved}
 
     @mcp.tool()
     async def write_1c(
