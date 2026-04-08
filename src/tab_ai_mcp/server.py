@@ -463,15 +463,21 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         expand: Optional[str] = None,
         top: int = 100,
         skip: int = 0,
+        odata_base_url: Optional[str] = None,
+        login: Optional[str] = None,
+        password: Optional[str] = None,
+        verify_ssl: bool = True,
+        timeout_seconds: int = 120,
     ) -> list[dict[str, Any]]:
         """
         Прочитать данные из 1С через OData.
         Read data from 1C via OData.
 
-        Credentials получаются автоматически из tab_ss по (organization, user_id).
+        Credentials: если переданы odata_base_url/login/password — используются напрямую.
+        Иначе получаются из tab_ss по (organization, user_id).
 
         Args:
-            organization: Код организации (ключ подключения к 1С в tab_ss). ОБЯЗАТЕЛЕН.
+            organization: Код организации (ключ подключения к 1С в tab_ss).
             query:        ЧТО читать. Три варианта:
 
                           1. ТОЧНЫЙ OData-путь (если известен):
@@ -510,18 +516,32 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                             → поле ВалютнаяСуммаBalance = валютный остаток (52)
                           ═══════════════════════════════════════════════════════
 
-            user_id:      ID пользователя (по умолчанию "").
-            model:        Модель семантического поиска.
-            filter:       OData $filter. Пример: "Account_Key eq guid'xxx'" или "Code eq '51'".
-            select:       Поля через запятую. По умолчанию — все поля.
-            expand:       OData $expand для вложенных объектов.
-            top:          Количество записей (по умолчанию 100).
-            skip:         Сдвиг для пагинации.
+            user_id:          ID пользователя (по умолчанию "").
+            model:            Модель семантического поиска.
+            filter:           OData $filter. Пример: "Account_Key eq guid'xxx'" или "Code eq '51'".
+            select:           Поля через запятую. По умолчанию — все поля.
+            expand:           OData $expand для вложенных объектов.
+            top:              Количество записей (по умолчанию 100).
+            skip:             Сдвиг для пагинации.
+            odata_base_url:   URL базы 1С (если передан — credentials из tab_ss не запрашиваются).
+            login:            Логин 1С (используется вместе с odata_base_url).
+            password:         Пароль 1С (используется вместе с odata_base_url).
+            verify_ssl:       Проверять SSL (по умолчанию True).
+            timeout_seconds:  Таймаут запроса в секундах (по умолчанию 120).
 
         Returns:
             Список объектов в формате JSON.
         """
-        conn = await _fetch_onec_credentials(organization, user_id)
+        if odata_base_url:
+            conn = {
+                "odata_base_url": odata_base_url.rstrip("/"),
+                "login": login or "",
+                "password": password or "",
+                "verify_ssl": verify_ssl,
+                "timeout_seconds": timeout_seconds,
+            }
+        else:
+            conn = await _fetch_onec_credentials(organization, user_id)
         resolved = (
             query if _looks_like_odata_name(query) or "/" in query
             else await _resolve_entity_type(query, model=model, organization=organization, user_id=user_id)
@@ -554,30 +574,50 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         data: dict[str, Any] | list[dict[str, Any]],
         user_id: str = "",
         model: str = TAB_SS_MODEL,
+        odata_base_url: Optional[str] = None,
+        login: Optional[str] = None,
+        password: Optional[str] = None,
+        verify_ssl: bool = True,
+        timeout_seconds: int = 120,
     ) -> dict[str, Any]:
         """
         Записать данные в 1С через OData (upsert).
         Write data to 1C via OData (upsert).
 
-        Credentials получаются автоматически из tab_ss по (organization, user_id).
+        Credentials: если переданы odata_base_url/login/password — используются напрямую.
+        Иначе получаются из tab_ss по (organization, user_id).
 
         Логика upsert:
           - есть Ref_Key в data → PATCH (обновление существующего объекта)
           - нет Ref_Key         → POST  (создание нового объекта)
 
         Args:
-            organization: Код организации. ОБЯЗАТЕЛЕН.
-            query:        Точное OData-имя или описание на русском/английском.
-                          Примеры: "Catalog_Номенклатура", "Document_РеализацияТоваровУслуг",
-                                   "номенклатура", "реализация товаров"
-            data:         Объект или список объектов для записи.
-            user_id:      ID пользователя (по умолчанию "").
-            model:        Модель семантического поиска.
+            organization:     Код организации.
+            query:            Точное OData-имя или описание на русском/английском.
+                              Примеры: "Catalog_Номенклатура", "Document_РеализацияТоваровУслуг",
+                                       "номенклатура", "реализация товаров"
+            data:             Объект или список объектов для записи.
+            user_id:          ID пользователя (по умолчанию "").
+            model:            Модель семантического поиска.
+            odata_base_url:   URL базы 1С (если передан — credentials из tab_ss не запрашиваются).
+            login:            Логин 1С.
+            password:         Пароль 1С.
+            verify_ssl:       Проверять SSL (по умолчанию True).
+            timeout_seconds:  Таймаут запроса в секундах (по умолчанию 120).
 
         Returns:
             {"written": N, "items": [...]}
         """
-        conn = await _fetch_onec_credentials(organization, user_id)
+        if odata_base_url:
+            conn = {
+                "odata_base_url": odata_base_url.rstrip("/"),
+                "login": login or "",
+                "password": password or "",
+                "verify_ssl": verify_ssl,
+                "timeout_seconds": timeout_seconds,
+            }
+        else:
+            conn = await _fetch_onec_credentials(organization, user_id)
         resolved = (
             query if _looks_like_odata_name(query) or "/" in query
             else await _resolve_entity_type(query, model=model, organization=organization, user_id=user_id)
