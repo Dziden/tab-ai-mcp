@@ -713,8 +713,9 @@ def main() -> None:
         # Railway задаёт PORT; MCP_PORT как явный override
         port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8001")
 
-        # Добавляем /logs напрямую в роутер MCP-приложения (тот же процесс → тот же _request_log)
-        mcp_app = mcp.streamable_http_app()
+        # stateless_http=True — каждый запрос независим, без session handshake
+        # Нужно для клиентов которые не реализуют полный MCP session protocol
+        mcp_app = mcp.streamable_http_app(stateless_http=True)
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         combined_app = mcp_app
 
