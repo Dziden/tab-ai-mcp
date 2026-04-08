@@ -34,7 +34,12 @@ def _make_client(
     verify_ssl: bool = True,
     timeout: int = 120,
 ) -> httpx.AsyncClient:
-    odata_url = f"{base_url.rstrip('/')}/odata/standard.odata"
+    # Если URL уже содержит /odata/standard.odata — не добавляем повторно
+    stripped = base_url.rstrip("/")
+    if stripped.endswith("/odata/standard.odata"):
+        odata_url = stripped
+    else:
+        odata_url = f"{stripped}/odata/standard.odata"
     auth = httpx.BasicAuth(login, password) if login else None
     return httpx.AsyncClient(
         base_url=odata_url,
