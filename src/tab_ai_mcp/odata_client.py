@@ -142,7 +142,7 @@ async def query(
     filter: Optional[str] = None,
     select: Optional[str] = None,
     expand: Optional[str] = None,
-    top: int = 20,
+    top: int = 100,
     skip: int = 0,
     orderby: Optional[str] = None,
     base_url: str = "",

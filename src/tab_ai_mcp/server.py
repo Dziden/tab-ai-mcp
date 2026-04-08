@@ -453,12 +453,13 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
     @mcp.tool()
     async def read_1c(
-        entity_type: str,
         organization: str,
+        entity_type: str = "",
         user_id: str = "",
         model: str = TAB_SS_MODEL,
         filter: Optional[str] = None,
         select: Optional[str] = None,
+        expand: Optional[str] = None,
         top: int = 100,
         skip: int = 0,
     ) -> list[dict[str, Any]]:
@@ -466,21 +467,55 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         Прочитать данные из 1С через OData.
         Read data from 1C via OData.
 
-        Credentials (URL базы, логин, пароль) получаются автоматически из tab_ss
-        по паре (organization, user_id) — не передаются явно.
+        Credentials получаются автоматически из tab_ss по (organization, user_id).
+
+        ═══════════════════════════════════════════════════════════
+        ВЫБОР entity_type — КРИТИЧЕСКИ ВАЖНО:
+        ═══════════════════════════════════════════════════════════
+
+        1. ОСТАТКИ НА ДАТУ → виртуальная таблица /Balance:
+           "AccountingRegister_X/Balance(Period=datetime'YYYY-MM-DDT00:00:00')"
+           Поля: Account_Key, СуммаBalance, ВалютнаяСуммаBalance
+           ⚠ filter обязателен: "Account_Key eq guid'<Ref_Key>'"
+
+        2. ОБОРОТЫ ЗА ПЕРИОД → /Turnovers:
+           "AccountingRegister_X/Turnovers(StartPeriod=datetime'...', EndPeriod=datetime'...')"
+           Поля: СуммаDrTurnover, СуммаCrTurnover
+
+        3. ЖУРНАЛ ПРОВОДОК → _RecordType:
+           "AccountingRegister_X_RecordType"
+           Поля: Period, AccountDr_Key, AccountCr_Key, Сумма
+           Только для просмотра проводок, НЕ для расчёта остатков!
+
+        ⚠ AccountingRegister_X БЕЗ суффикса → автоматически добавляется _RecordType.
+          Для остатков ВСЕГДА используй /Balance(Period=...) — иначе получишь
+          сырые проводки и будешь считать вручную, что НЕВЕРНО для накопленных остатков!
+
+        ═══════════════════════════════════════════════════════════
+        АЛГОРИТМ: остаток по банку (счета 51, 52, 55) на дату:
+        ═══════════════════════════════════════════════════════════
+        # ChartOfAccounts НЕ поддерживает 'or' — отдельный запрос для каждого счёта!
+        ref51 = read_1c(org, "ChartOfAccounts_Хозрасчетный", filter="Code eq '51'")[0]["Ref_Key"]
+        ref52 = read_1c(org, "ChartOfAccounts_Хозрасчетный", filter="Code eq '52'")[0]["Ref_Key"]
+        ref55 = read_1c(org, "ChartOfAccounts_Хозрасчетный", filter="Code eq '55'")[0]["Ref_Key"]
+        bal51 = read_1c(org, "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')",
+                        filter=f"Account_Key eq guid'{ref51}'")
+        # → СуммаBalance = рублёвый остаток на счёте 51
+        # Аналогично для 52 (ВалютнаяСуммаBalance) и 55.
+        ═══════════════════════════════════════════════════════════
 
         Args:
-            entity_type:  OData тип объекта или описание на русском/английском.
-                          Точное имя: "Catalog_Номенклатура", "AccountingRegister_Хозрасчетный"
-                          Описание:   "остатки товаров", "задолженность покупателей"
-            organization: Код организации (ключ подключения к 1С в tab_ss).
+            organization: Код организации (ключ подключения к 1С в tab_ss). ОБЯЗАТЕЛЕН.
+            entity_type:  OData тип или описание на русском/английском.
+                          Если пусто — резолвится через семантический поиск по filter/контексту.
+                          Точное имя: "Catalog_Номенклатура"
+                          Виртуальная таблица: "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')"
+                          Описание: "остатки товаров на складах" (резолвится автоматически)
             user_id:      ID пользователя для изоляции подключений (по умолчанию "").
-            model:        Модель семантического поиска (openai, deepseek, qwen32 и др.).
-            filter:       OData $filter выражение.
-                          Примеры:
-                            "Description eq 'Молоко'"
-                            "Period ge datetime'2024-01-01T00:00:00'"
-            select:       Поля через запятую. Если не указан — все поля.
+            model:        Модель семантического поиска.
+            filter:       OData $filter. Пример: "Account_Key eq guid'xxx'" или "Code eq '51'".
+            select:       Поля через запятую. По умолчанию — все поля.
+            expand:       OData $expand для вложенных объектов.
             top:          Количество записей (по умолчанию 100).
             skip:         Сдвиг для пагинации.
 
@@ -488,15 +523,19 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             Список объектов в формате JSON.
         """
         conn = await _fetch_onec_credentials(organization, user_id)
+        if not entity_type:
+            # Резолв по filter как подсказке, либо fallback на локальный индекс
+            hint = filter or ""
+            entity_type = await _resolve_entity_type(hint, model=model, organization=organization, user_id=user_id)
         resolved = (
-            entity_type if _looks_like_odata_name(entity_type)
+            entity_type if _looks_like_odata_name(entity_type) or "/" in entity_type
             else await _resolve_entity_type(entity_type, model=model, organization=organization, user_id=user_id)
         )
         resolved = _normalize_entity_for_read(resolved)
         t0 = time.monotonic()
         try:
             result = await oc.query(
-                resolved, filter=filter, select=select, top=top, skip=skip,
+                resolved, filter=filter, select=select, expand=expand, top=top, skip=skip,
                 base_url=conn["odata_base_url"],
                 login=conn["login"],
                 password=conn["password"],
