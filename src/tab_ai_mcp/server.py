@@ -713,10 +713,17 @@ def main() -> None:
         # Railway задаёт PORT; MCP_PORT как явный override
         port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8001")
 
-        # stateless_http=True — каждый запрос независим, без session handshake.
         # host="0.0.0.0" — отключает DNS rebinding protection (default host=127.0.0.1
         # автоматически включает защиту и блокирует все внешние хосты с 421).
-        mcp_app = mcp.streamable_http_app(stateless_http=True, host=host)
+        # stateless_http=True — каждый запрос независим, без session handshake.
+        # Оба параметра появились в разных версиях mcp — используем try/except.
+        try:
+            mcp_app = mcp.streamable_http_app(stateless_http=True, host=host)
+        except TypeError:
+            try:
+                mcp_app = mcp.streamable_http_app(host=host)
+            except TypeError:
+                mcp_app = mcp.streamable_http_app()
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         combined_app = mcp_app
 
