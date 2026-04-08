@@ -454,7 +454,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
     @mcp.tool()
     async def read_1c(
         organization: str,
-        entity_type: str = "",
+        query: str,
         user_id: str = "",
         model: str = TAB_SS_MODEL,
         filter: Optional[str] = None,
@@ -469,49 +469,47 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
         Credentials получаются автоматически из tab_ss по (organization, user_id).
 
-        ═══════════════════════════════════════════════════════════
-        ВЫБОР entity_type — КРИТИЧЕСКИ ВАЖНО:
-        ═══════════════════════════════════════════════════════════
-
-        1. ОСТАТКИ НА ДАТУ → виртуальная таблица /Balance:
-           "AccountingRegister_X/Balance(Period=datetime'YYYY-MM-DDT00:00:00')"
-           Поля: Account_Key, СуммаBalance, ВалютнаяСуммаBalance
-           ⚠ filter обязателен: "Account_Key eq guid'<Ref_Key>'"
-
-        2. ОБОРОТЫ ЗА ПЕРИОД → /Turnovers:
-           "AccountingRegister_X/Turnovers(StartPeriod=datetime'...', EndPeriod=datetime'...')"
-           Поля: СуммаDrTurnover, СуммаCrTurnover
-
-        3. ЖУРНАЛ ПРОВОДОК → _RecordType:
-           "AccountingRegister_X_RecordType"
-           Поля: Period, AccountDr_Key, AccountCr_Key, Сумма
-           Только для просмотра проводок, НЕ для расчёта остатков!
-
-        ⚠ AccountingRegister_X БЕЗ суффикса → автоматически добавляется _RecordType.
-          Для остатков ВСЕГДА используй /Balance(Period=...) — иначе получишь
-          сырые проводки и будешь считать вручную, что НЕВЕРНО для накопленных остатков!
-
-        ═══════════════════════════════════════════════════════════
-        АЛГОРИТМ: остаток по банку (счета 51, 52, 55) на дату:
-        ═══════════════════════════════════════════════════════════
-        # ChartOfAccounts НЕ поддерживает 'or' — отдельный запрос для каждого счёта!
-        ref51 = read_1c(org, "ChartOfAccounts_Хозрасчетный", filter="Code eq '51'")[0]["Ref_Key"]
-        ref52 = read_1c(org, "ChartOfAccounts_Хозрасчетный", filter="Code eq '52'")[0]["Ref_Key"]
-        ref55 = read_1c(org, "ChartOfAccounts_Хозрасчетный", filter="Code eq '55'")[0]["Ref_Key"]
-        bal51 = read_1c(org, "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')",
-                        filter=f"Account_Key eq guid'{ref51}'")
-        # → СуммаBalance = рублёвый остаток на счёте 51
-        # Аналогично для 52 (ВалютнаяСуммаBalance) и 55.
-        ═══════════════════════════════════════════════════════════
-
         Args:
             organization: Код организации (ключ подключения к 1С в tab_ss). ОБЯЗАТЕЛЕН.
-            entity_type:  OData тип или описание на русском/английском.
-                          Если пусто — резолвится через семантический поиск по filter/контексту.
-                          Точное имя: "Catalog_Номенклатура"
-                          Виртуальная таблица: "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')"
-                          Описание: "остатки товаров на складах" (резолвится автоматически)
-            user_id:      ID пользователя для изоляции подключений (по умолчанию "").
+            query:        ЧТО читать. Три варианта:
+
+                          1. ТОЧНЫЙ OData-путь (если известен):
+                             "Catalog_Номенклатура"
+                             "Document_РеализацияТоваровУслуг"
+                             "ChartOfAccounts_Хозрасчетный"
+
+                          2. ВИРТУАЛЬНАЯ ТАБЛИЦА для остатков/оборотов:
+                             Остатки на дату:
+                               "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')"
+                               Поля ответа: Account_Key, СуммаBalance, ВалютнаяСуммаBalance
+                             Обороты за период:
+                               "AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime'2025-01-01T00:00:00',EndPeriod=datetime'2025-12-31T00:00:00')"
+                             Накопительный регистр — остатки:
+                               "AccumulationRegister_ТоварыНаСкладах/Balance(Period=datetime'2025-12-31T00:00:00')"
+
+                          3. ОПИСАНИЕ НА РУССКОМ/АНГЛИЙСКОМ (резолвится автоматически):
+                             "остатки товаров на складах"
+                             "задолженность покупателей"
+                             "список контрагентов"
+
+                          ═══ ОСТАТКИ ПО БАНКУ — ПОШАГОВЫЙ АЛГОРИТМ ════════════
+                          Шаг 1. Получить Ref_Key для каждого счёта отдельно
+                                 (ChartOfAccounts НЕ поддерживает 'or' в filter!):
+                            ref51 = read_1c(org, "ChartOfAccounts_Хозрасчетный",
+                                            filter="Code eq '51'")[0]["Ref_Key"]
+                            ref52 = read_1c(org, "ChartOfAccounts_Хозрасчетный",
+                                            filter="Code eq '52'")[0]["Ref_Key"]
+                            ref55 = read_1c(org, "ChartOfAccounts_Хозрасчетный",
+                                            filter="Code eq '55'")[0]["Ref_Key"]
+                          Шаг 2. Запросить Balance для каждого счёта:
+                            read_1c(org,
+                              "AccountingRegister_Хозрасчетный/Balance(Period=datetime'2025-12-31T00:00:00')",
+                              filter="Account_Key eq guid'<ref51>'")
+                            → поле СуммаBalance = рублёвый остаток (51, 55)
+                            → поле ВалютнаяСуммаBalance = валютный остаток (52)
+                          ═══════════════════════════════════════════════════════
+
+            user_id:      ID пользователя (по умолчанию "").
             model:        Модель семантического поиска.
             filter:       OData $filter. Пример: "Account_Key eq guid'xxx'" или "Code eq '51'".
             select:       Поля через запятую. По умолчанию — все поля.
@@ -523,13 +521,9 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             Список объектов в формате JSON.
         """
         conn = await _fetch_onec_credentials(organization, user_id)
-        if not entity_type:
-            # Резолв по filter как подсказке, либо fallback на локальный индекс
-            hint = filter or ""
-            entity_type = await _resolve_entity_type(hint, model=model, organization=organization, user_id=user_id)
         resolved = (
-            entity_type if _looks_like_odata_name(entity_type) or "/" in entity_type
-            else await _resolve_entity_type(entity_type, model=model, organization=organization, user_id=user_id)
+            query if _looks_like_odata_name(query) or "/" in query
+            else await _resolve_entity_type(query, model=model, organization=organization, user_id=user_id)
         )
         resolved = _normalize_entity_for_read(resolved)
         t0 = time.monotonic()
@@ -542,20 +536,20 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                 verify_ssl=conn.get("verify_ssl", True),
                 timeout=conn.get("timeout_seconds", 120),
             )
-            _log_request("read_1c", entity_type, resolved,
+            _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, rows=len(result))
             return result
         except Exception as exc:
-            _log_request("read_1c", entity_type, resolved,
+            _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, error=str(exc))
             raise
 
     @mcp.tool()
     async def write_1c(
-        entity_type: str,
         organization: str,
+        query: str,
         data: dict[str, Any] | list[dict[str, Any]],
         user_id: str = "",
         model: str = TAB_SS_MODEL,
@@ -567,23 +561,25 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         Credentials получаются автоматически из tab_ss по (organization, user_id).
 
         Логика upsert:
-          - есть Ref_Key → PATCH (обновление существующего)
-          - нет Ref_Key  → POST  (создание нового)
+          - есть Ref_Key в data → PATCH (обновление существующего объекта)
+          - нет Ref_Key         → POST  (создание нового объекта)
 
         Args:
-            entity_type:  OData тип объекта или описание на русском/английском.
-            organization: Код организации.
+            organization: Код организации. ОБЯЗАТЕЛЕН.
+            query:        Точное OData-имя или описание на русском/английском.
+                          Примеры: "Catalog_Номенклатура", "Document_РеализацияТоваровУслуг",
+                                   "номенклатура", "реализация товаров"
             data:         Объект или список объектов для записи.
             user_id:      ID пользователя (по умолчанию "").
-            model:        Модель семантического поиска для резолва entity_type.
+            model:        Модель семантического поиска.
 
         Returns:
             {"written": N, "items": [...]}
         """
         conn = await _fetch_onec_credentials(organization, user_id)
         resolved = (
-            entity_type if _looks_like_odata_name(entity_type)
-            else await _resolve_entity_type(entity_type, model=model, organization=organization, user_id=user_id)
+            query if _looks_like_odata_name(query) or "/" in query
+            else await _resolve_entity_type(query, model=model, organization=organization, user_id=user_id)
         )
         items = data if isinstance(data, list) else [data]
         results = []
@@ -611,11 +607,11 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                         timeout=conn.get("timeout_seconds", 120),
                     )
                     results.append({"action": "created", "result": result})
-            _log_request("write_1c", entity_type, resolved, {"org": organization, "count": len(items)},
+            _log_request("write_1c", query, resolved, {"org": organization, "count": len(items)},
                          (time.monotonic() - t0) * 1000, rows=len(results))
             return {"written": len(results), "items": results}
         except Exception as exc:
-            _log_request("write_1c", entity_type, resolved, {"org": organization, "count": len(items)},
+            _log_request("write_1c", query, resolved, {"org": organization, "count": len(items)},
                          (time.monotonic() - t0) * 1000, error=str(exc))
             raise
 
