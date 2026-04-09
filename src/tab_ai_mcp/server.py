@@ -30,10 +30,12 @@ tab_mcp — MCP-коннектор к 1С:Предприятие
 from __future__ import annotations
 
 import asyncio
+import base64 as _base64
 import hashlib
 import json
 import logging
 import os
+import re as _re
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -124,10 +126,63 @@ _PREFIX_MAP = {
 }
 
 
+# Имена полей, которые заведомо содержат бинарные данные в 1С
+_BINARY_FIELD_NAMES = frozenset({
+    "двоичныеданные", "данные", "картинка", "фото", "изображение",
+    "logo", "picture", "image", "photo", "binary", "data",
+})
+
+# Минимальная длина строки, после которой проверяем на base64
+_BINARY_MIN_LEN = 256
+
+
+def _is_base64_like(s: str) -> bool:
+    """Эвристика: строка длинная и состоит из base64-символов."""
+    if len(s) < _BINARY_MIN_LEN:
+        return False
+    sample = s[:512].rstrip("=")
+    valid = sum(1 for c in sample if c in
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    return valid / max(len(sample), 1) > 0.95
+
+
+def _binary_placeholder(value: str) -> str:
+    try:
+        size = len(_base64.b64decode(value + "=="))
+    except Exception:
+        size = len(value) * 3 // 4
+    if size >= 1024:
+        return f"<ДвоичныеДанные: ~{size // 1024} KB>"
+    return f"<ДвоичныеДанные: ~{size} B>"
+
+
+def _strip_binary_fields(obj: Any) -> Any:
+    """
+    Рекурсивно заменяет бинарные поля в OData-ответе плейсхолдером,
+    чтобы не засорять контекст LLM длинными base64-строками.
+
+    Детектирует бинарные данные двумя способами:
+    1. По имени поля (ДвоичныеДанные, Картинка и т.д.)
+    2. По содержимому — длинная base64-строка (>256 символов, >95% base64-алфавит)
+    """
+    if isinstance(obj, list):
+        return [_strip_binary_fields(item) for item in obj]
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if isinstance(v, str) and (
+                k.lower() in _BINARY_FIELD_NAMES or _is_base64_like(v)
+            ):
+                result[k] = _binary_placeholder(v)
+            else:
+                result[k] = _strip_binary_fields(v)
+        return result
+    return obj
+
+
 def _split_camel(name: str) -> str:
     """РеализацияТоваровУслуг → Реализация Товаров Услуг"""
-    import re
-    result = re.sub(r"(?<=[а-яёa-z0-9])(?=[А-ЯЁA-Z])", " ", name)
+    result = _re.sub(r"(?<=[а-яёa-z0-9])(?=[А-ЯЁA-Z])", " ", name)
     return result
 
 
@@ -571,6 +626,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                 verify_ssl=conn.get("verify_ssl", True),
                 timeout=conn.get("timeout_seconds", 120),
             )
+            result = _strip_binary_fields(result)
             _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, rows=len(result))
