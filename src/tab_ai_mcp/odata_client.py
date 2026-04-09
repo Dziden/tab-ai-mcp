@@ -91,6 +91,45 @@ def _extract_value(data: Any) -> Any:
 
 # ── API Methods ────────────────────────────────────────────────────────────────
 
+def _parse_metadata_xml(xml_text: str) -> tuple[list[str], dict[str, list[str]]]:
+    """
+    Разобрать $metadata XML.
+    Возвращает:
+      - список имён EntityType
+      - словарь {EntityType: [binary_field, ...]} для полей типа Edm.Binary
+        (соответствует 1С-типам ДвоичныеДанные и ХранилищеЗначения)
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise RuntimeError(f"Не удалось разобрать $metadata XML: {e}") from e
+
+    entity_types: list[str] = []
+    binary_fields_map: dict[str, list[str]] = {}
+
+    for elem in root.iter():
+        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if local == "EntityType":
+            name = elem.get("Name", "")
+            if not name:
+                continue
+            entity_types.append(name)
+            binary: list[str] = []
+            for child in elem:
+                child_local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if child_local == "Property":
+                    prop_type = child.get("Type", "")
+                    # Edm.Binary покрывает и ДвоичныеДанные, и ХранилищеЗначения в 1С OData
+                    if "Binary" in prop_type:
+                        field_name = child.get("Name", "")
+                        if field_name:
+                            binary.append(field_name)
+            if binary:
+                binary_fields_map[name] = binary
+
+    return entity_types, binary_fields_map
+
+
 async def get_metadata(
     base_url: str = "",
     login: str = "",
@@ -110,18 +149,7 @@ async def get_metadata(
     response.raise_for_status()
     xml_text = response.text
 
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        raise RuntimeError(f"Не удалось разобрать $metadata XML: {e}") from e
-
-    entity_types: list[str] = []
-    for elem in root.iter():
-        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-        if local == "EntityType":
-            name = elem.get("Name", "")
-            if name:
-                entity_types.append(name)
+    entity_types, binary_fields_map = _parse_metadata_xml(xml_text)
 
     catalogs = sorted([t for t in entity_types if t.startswith("Catalog_")])
     documents = sorted([t for t in entity_types if t.startswith("Document_")])
@@ -139,7 +167,31 @@ async def get_metadata(
         "registers": registers,
         "other": other,
         "total": len(entity_types),
+        "binary_fields": binary_fields_map,
     }
+
+
+async def get_binary_fields_map(
+    base_url: str = "",
+    login: str = "",
+    password: str = "",
+    verify_ssl: bool = True,
+    timeout: int = 120,
+) -> dict[str, list[str]]:
+    """
+    Получить маппинг {EntityType: [binary_field, ...]} из $metadata.
+    Используется для точного определения бинарных полей (Edm.Binary)
+    без эвристик. Соответствует 1С-типам ДвоичныеДанные и ХранилищеЗначения.
+    """
+    client_ctx = (
+        _make_client(base_url, login, password, verify_ssl, timeout)
+        if base_url else _env_client()
+    )
+    async with client_ctx as client:
+        response = await client.get("/$metadata", headers={"Accept": "application/xml"})
+    response.raise_for_status()
+    _, binary_fields_map = _parse_metadata_xml(response.text)
+    return binary_fields_map
 
 
 async def query(

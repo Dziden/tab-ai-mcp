@@ -77,6 +77,34 @@ _METADATA_TTL = 7 * 24 * 3600
 _CONN_CACHE: dict[tuple[str, str], tuple[dict, float]] = {}
 _CONN_CACHE_TTL = 300.0
 
+# ── Кеш бинарных полей из $metadata ───────────────────────────────────────────
+# Ключ: base_url → ({EntityType: [binary_field, ...]}, expires_at)
+# TTL 1 час — метаданные меняются только при обновлении конфигурации 1С
+_BINARY_MAP_CACHE: dict[str, tuple[dict[str, list[str]], float]] = {}
+_BINARY_MAP_TTL = 3600.0
+
+
+async def _get_binary_map(conn: dict) -> dict[str, list[str]]:
+    """Вернуть {EntityType: [binary_fields]} из $metadata, с кешированием."""
+    base_url = conn["odata_base_url"]
+    cached = _BINARY_MAP_CACHE.get(base_url)
+    if cached and time.monotonic() < cached[1]:
+        return cached[0]
+    try:
+        bmap = await oc.get_binary_fields_map(
+            base_url=base_url,
+            login=conn.get("login", ""),
+            password=conn.get("password", ""),
+            verify_ssl=conn.get("verify_ssl", True),
+            timeout=conn.get("timeout_seconds", 120),
+        )
+        _BINARY_MAP_CACHE[base_url] = (bmap, time.monotonic() + _BINARY_MAP_TTL)
+        logger.info("Загружен binary fields map: %d сущностей с Edm.Binary полями", len(bmap))
+        return bmap
+    except Exception as exc:
+        logger.warning("Не удалось загрузить binary fields map: %s", exc)
+        return {}
+
 # ── Лог запросов ───────────────────────────────────────────────────────────────
 
 _LOG_API_KEY = os.environ.get("LOG_API_KEY", TAB_SS_KEY)
@@ -155,38 +183,42 @@ def _binary_placeholder(value: str) -> str:
     return f"<ДвоичныеДанные: ~{size} B>"
 
 
-def _strip_binary_fields(obj: Any) -> Any:
+def _strip_binary_fields(
+    obj: Any,
+    known_binary: frozenset[str] = frozenset(),
+) -> Any:
     """
     Рекурсивно заменяет бинарные поля в OData-ответе плейсхолдером,
     чтобы не засорять контекст LLM длинными base64-строками.
 
-    Детектирует бинарные данные двумя способами:
-    1. По OData type-аннотации "Field@odata.type": "#Binary" / "#ValueStorage"
-       (1С ставит для типов ДвоичныеДанные и ХранилищеЗначения).
-       Аннотационные ключи (*@odata.type) убираются из результата.
-    2. Fallback: строка длиннее 512 символов с >97% base64-алфавита —
-       на случай когда 1С не присылает @odata.type (metadata=minimal).
+    Приоритет детекции:
+    1. known_binary — точный список полей из $metadata (Edm.Binary),
+       соответствует 1С-типам ДвоичныеДанные и ХранилищеЗначения.
+    2. @odata.type аннотации в самом ответе (если 1С их прислал).
+    3. Fallback: строка >512 символов с >97% base64-алфавита.
+    Аннотационные ключи (*@odata.type) убираются из результата.
     """
     if isinstance(obj, list):
-        return [_strip_binary_fields(item) for item in obj]
+        return [_strip_binary_fields(item, known_binary) for item in obj]
     if isinstance(obj, dict):
-        # Шаг 1: собрать поля, явно помеченные как бинарные через @odata.type
-        binary_fields: set[str] = set()
+        # Собрать поля, помеченные как бинарные через @odata.type аннотации в ответе
+        annotated_binary: set[str] = set()
         for k, v in obj.items():
             if "@odata.type" in k and isinstance(v, str):
                 field_name = k.split("@odata.type")[0]
                 if any(t in v.lower() for t in _BINARY_ODATA_TYPES):
-                    binary_fields.add(field_name)
+                    annotated_binary.add(field_name)
 
         result = {}
         for k, v in obj.items():
-            # Аннотационные ключи не нужны LLM
             if "@odata.type" in k:
                 continue
-            if isinstance(v, str) and (k in binary_fields or _is_base64_like(v)):
+            if isinstance(v, str) and (
+                k in known_binary or k in annotated_binary or _is_base64_like(v)
+            ):
                 result[k] = _binary_placeholder(v)
             else:
-                result[k] = _strip_binary_fields(v)
+                result[k] = _strip_binary_fields(v, known_binary)
         return result
     return obj
 
@@ -627,6 +659,8 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             else await _resolve_entity_type(clean_query, model=model, organization=organization, user_id=user_id)
         )
         resolved = _normalize_entity_for_read(resolved)
+        # Базовое имя сущности без виртуальной таблицы: "Catalog_Файлы/..." → "Catalog_Файлы"
+        entity_base = resolved.split("/")[0].replace("_RecordType", "")
         t0 = time.monotonic()
         try:
             result = await oc.query(
@@ -637,7 +671,9 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                 verify_ssl=conn.get("verify_ssl", True),
                 timeout=conn.get("timeout_seconds", 120),
             )
-            result = _strip_binary_fields(result)
+            binary_map = await _get_binary_map(conn)
+            known_binary = frozenset(binary_map.get(entity_base, []))
+            result = _strip_binary_fields(result, known_binary)
             _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, rows=len(result))
