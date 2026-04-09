@@ -126,24 +126,23 @@ _PREFIX_MAP = {
 }
 
 
-# Имена полей, которые заведомо содержат бинарные данные в 1С
-_BINARY_FIELD_NAMES = frozenset({
-    "двоичныеданные", "данные", "картинка", "фото", "изображение",
-    "logo", "picture", "image", "photo", "binary", "data",
-})
+# Типы OData от 1С, указывающие на бинарное содержимое.
+# 1С пишет "#Binary" для ДвоичныеДанные и "#ValueStorage" для ХранилищеЗначения.
+_BINARY_ODATA_TYPES = ("binary", "valuestorage", "хранилищезначения", "двоичныеданные")
 
-# Минимальная длина строки, после которой проверяем на base64
-_BINARY_MIN_LEN = 256
+# Fallback: минимальная длина строки для проверки на base64.
+# При odata.metadata=minimal 1С может не присылать @odata.type для Edm.Binary полей.
+_BINARY_MIN_LEN = 512
 
 
 def _is_base64_like(s: str) -> bool:
-    """Эвристика: строка длинная и состоит из base64-символов."""
+    """Эвристика-fallback: строка длинная и почти полностью состоит из base64-символов."""
     if len(s) < _BINARY_MIN_LEN:
         return False
-    sample = s[:512].rstrip("=")
+    sample = s[:1024].rstrip("=")
     valid = sum(1 for c in sample if c in
                 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-    return valid / max(len(sample), 1) > 0.95
+    return valid / max(len(sample), 1) > 0.97
 
 
 def _binary_placeholder(value: str) -> str:
@@ -162,17 +161,29 @@ def _strip_binary_fields(obj: Any) -> Any:
     чтобы не засорять контекст LLM длинными base64-строками.
 
     Детектирует бинарные данные двумя способами:
-    1. По имени поля (ДвоичныеДанные, Картинка и т.д.)
-    2. По содержимому — длинная base64-строка (>256 символов, >95% base64-алфавит)
+    1. По OData type-аннотации "Field@odata.type": "#Binary" / "#ValueStorage"
+       (1С ставит для типов ДвоичныеДанные и ХранилищеЗначения).
+       Аннотационные ключи (*@odata.type) убираются из результата.
+    2. Fallback: строка длиннее 512 символов с >97% base64-алфавита —
+       на случай когда 1С не присылает @odata.type (metadata=minimal).
     """
     if isinstance(obj, list):
         return [_strip_binary_fields(item) for item in obj]
     if isinstance(obj, dict):
+        # Шаг 1: собрать поля, явно помеченные как бинарные через @odata.type
+        binary_fields: set[str] = set()
+        for k, v in obj.items():
+            if "@odata.type" in k and isinstance(v, str):
+                field_name = k.split("@odata.type")[0]
+                if any(t in v.lower() for t in _BINARY_ODATA_TYPES):
+                    binary_fields.add(field_name)
+
         result = {}
         for k, v in obj.items():
-            if isinstance(v, str) and (
-                k.lower() in _BINARY_FIELD_NAMES or _is_base64_like(v)
-            ):
+            # Аннотационные ключи не нужны LLM
+            if "@odata.type" in k:
+                continue
+            if isinstance(v, str) and (k in binary_fields or _is_base64_like(v)):
                 result[k] = _binary_placeholder(v)
             else:
                 result[k] = _strip_binary_fields(v)
