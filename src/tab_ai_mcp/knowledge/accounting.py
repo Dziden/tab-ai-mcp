@@ -104,9 +104,10 @@ INSTRUCTIONS = """
 ⚠ ОСТАТОК ПО БАНКУ — запрашивать ВСЕ ТРИ счёта: 51, 52, 55 (НЕ только 51!):
 
   Шаг 1. Для каждого счёта — ОТДЕЛЬНЫЙ запрос (ChartOfAccounts не поддерживает 'or'!):
-    ref51 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '51'")[0]["Ref_Key"]
-    ref52 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '52'")[0]["Ref_Key"]
-    ref55 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '55'")[0]["Ref_Key"]
+    ⚠ ОБЯЗАТЕЛЬНО указывать select="Ref_Key" — без него запрос возвращает все поля и может зависнуть!
+    ref51 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '51'", select="Ref_Key")[0]["Ref_Key"]
+    ref52 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '52'", select="Ref_Key")[0]["Ref_Key"]
+    ref55 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '55'", select="Ref_Key")[0]["Ref_Key"]
 
   Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
     rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
@@ -125,7 +126,7 @@ INSTRUCTIONS = """
 
 Алгоритм остатка по произвольному счёту на дату:
 
-  ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq 'XX'")[0]["Ref_Key"]
+  ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq 'XX'", select="Ref_Key")[0]["Ref_Key"]
   rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
                  filter=f"Account_Key eq guid'{ref}'",
                  expand="Субконто1,Субконто2")
@@ -144,7 +145,7 @@ INSTRUCTIONS = """
 
   ⚠ НИКОГДА не передавать код счёта ('90.01', '51' и т.д.) напрямую как guid!
     ВСЕГДА сначала получать Ref_Key через ChartOfAccounts_Хозрасчетный:
-    ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'")[0]["Ref_Key"]
+    ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'", select="Ref_Key")[0]["Ref_Key"]
     Затем: filter=f"Account_Key eq guid'{ref9001}'"  ← вот так, с реальным GUID
 
   Структура счёта 90 (важно для правильного расчёта выручки):
@@ -156,7 +157,7 @@ INSTRUCTIONS = """
 
   Алгоритм (пошагово):
     # Шаг 1 — Ref_Key для 90.01 (отдельный запрос, 'or' не работает):
-    ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'")[0]["Ref_Key"]
+    ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'", select="Ref_Key")[0]["Ref_Key"]
 
     # Шаг 2 — обороты через Turnovers:
     rows = read_1c(
@@ -168,7 +169,7 @@ INSTRUCTIONS = """
     # Шаг 3 — если rows пустой (0 строк):
     # Значит проводки идут на субсчетах 90.01.1, 90.01.2 и т.д.
     # Запрашивать их ПОСЛЕДОВАТЕЛЬНО (отдельный запрос для каждого):
-    ref900101 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01.1'")[0]["Ref_Key"]
+    ref900101 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01.1'", select="Ref_Key")[0]["Ref_Key"]
     rows = read_1c("AccountingRegister_Хозрасчетный/Turnovers(...)", filter=f"Account_Key eq guid'{ref900101}'")
     # Если и 90.01.1 пустой — пробовать 90.01.2, и т.д.
     # ⚠ НЕ использовать родительский счёт 90 — он включает 90.03 (НДС) и 90.09, что исказит выручку!
@@ -239,8 +240,8 @@ PROMPTS = [
             "Рассчитай выручку и себестоимость за период с {date_from} по {date_to}.\n\n"
             "⚠ Не используй RecordType — только виртуальную таблицу Turnovers!\n\n"
             "Шаг 1. Получи Ref_Key счётов (каждый счёт — отдельный запрос, 'or' не работает):\n"
-            "  ref9001 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.01'\")[0]['Ref_Key']\n"
-            "  ref9002 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.02'\")[0]['Ref_Key']\n\n"
+            "  ref9001 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.01'\", select='Ref_Key')[0]['Ref_Key']\n"
+            "  ref9002 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.02'\", select='Ref_Key')[0]['Ref_Key']\n\n"
             "Шаг 2. Запроси обороты через Turnovers:\n"
             "  rows_rev = read_1c(\n"
             "    'AccountingRegister_Хозрасчетный/Turnovers(StartPeriod=datetime\\'{date_from}T00:00:00\\',EndPeriod=datetime\\'{date_to}T00:00:00\\')',\n"
@@ -249,7 +250,7 @@ PROMPTS = [
             "  Выручка = поле СуммаCrTurnover\n\n"
             "  ⚠ Если rows_rev пустой (0 строк) — проводки идут на субсчетах 90.01.1, 90.01.2...\n"
             "  Запрашивать последовательно (отдельный запрос для каждого):\n"
-            "  ref900101 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.01.1'\")[0]['Ref_Key']\n"
+            "  ref900101 = read_1c('ChartOfAccounts_Хозрасчетный', filter=\"Code eq '90.01.1'\", select='Ref_Key')[0]['Ref_Key']\n"
             "  rows_rev = read_1c(...Turnovers..., filter=f\"Account_Key eq guid'{{ref900101}}'\")\n"
             "  ⚠ НЕ использовать счёт 90 целиком — он включает НДС (90.03) и исказит выручку!\n\n"
             "  rows_cost = read_1c(...Turnovers..., filter=f\"Account_Key eq guid'{{ref9002}}'\"\n"

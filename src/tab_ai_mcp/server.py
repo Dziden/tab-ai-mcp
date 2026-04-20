@@ -68,6 +68,16 @@ TAB_SS_URL = (
 
 TAB_SS_MODEL = os.environ.get("TAB_SS_MODEL", "openai")
 
+# Ключ для аутентификации входящих запросов к MCP (X-Admin-Key).
+# По умолчанию совпадает с TAB_SS_API_KEY чтобы не вводить отдельный секрет.
+# Установите MCP_API_KEY явно если хотите другой ключ.
+# Если не задан — auth отключена (только для локальной разработки).
+MCP_API_KEY: str = (
+    os.environ.get("MCP_API_KEY")
+    or TAB_SS_KEY
+    or ""
+)
+
 # TTL метаданных в tab_ss — 7 дней (метаданные меняются редко)
 _METADATA_TTL = 7 * 24 * 3600
 
@@ -604,12 +614,14 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                           ═══ ОСТАТКИ ПО БАНКУ — ПОШАГОВЫЙ АЛГОРИТМ ════════════
                           ⚠ Запрашивать ВСЕ ТРИ счёта: 51, 52, 55 — НЕ только 51!
                           Шаг 1. Ref_Key каждого счёта — ОТДЕЛЬНЫЙ запрос:
+                            ⚠ ВСЕГДА указывать select="Ref_Key" при запросе ChartOfAccounts!
+                              Без select — сервер возвращает все поля и запрос зависает (таймаут 20 сек).
                             ref51 = read_1c("ChartOfAccounts_Хозрасчетный",
-                                            filter="Code eq '51'")[0]["Ref_Key"]
+                                            filter="Code eq '51'", select="Ref_Key")[0]["Ref_Key"]
                             ref52 = read_1c("ChartOfAccounts_Хозрасчетный",
-                                            filter="Code eq '52'")[0]["Ref_Key"]
+                                            filter="Code eq '52'", select="Ref_Key")[0]["Ref_Key"]
                             ref55 = read_1c("ChartOfAccounts_Хозрасчетный",
-                                            filter="Code eq '55'")[0]["Ref_Key"]
+                                            filter="Code eq '55'", select="Ref_Key")[0]["Ref_Key"]
                           Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
                             rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
                                              filter="Account_Key eq guid'<ref51>'", expand="Субконто1")
@@ -679,7 +691,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                          (time.monotonic() - t0) * 1000, rows=len(result))
             return {"value": result}
         except Exception as exc:
-            err = str(exc)
+            err = str(exc) or f"{type(exc).__name__}"
             _log_request("read_1c", query, resolved,
                          {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, error=err)
@@ -771,7 +783,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             return {"written": len(results), "items": results}
         except Exception as exc:
             _log_request("write_1c", query, resolved, {"org": organization, "count": len(items)},
-                         (time.monotonic() - t0) * 1000, error=str(exc))
+                         (time.monotonic() - t0) * 1000, error=str(exc) or f"{type(exc).__name__}")
             raise
 
     @mcp.tool()
@@ -824,6 +836,43 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         return _tab_ss_handle(response)
 
     return mcp
+
+
+# ── ASGI middleware: X-Admin-Key auth ─────────────────────────────────────────
+
+class _AuthMiddleware:
+    """Проверяет X-Admin-Key на всех входящих запросах.
+
+    Если MCP_API_KEY не задан — пропускает все запросы (dev-режим).
+    Возвращает 401 JSON при отсутствии или неверном ключе.
+    """
+
+    _BYPASS_PATHS = {"/health", "/logs"}
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or not MCP_API_KEY:
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path in self._BYPASS_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        key = (headers.get(b"x-admin-key") or b"").decode()
+        if key != MCP_API_KEY:
+            body = b'{"error":"Unauthorized","detail":"Missing or invalid X-Admin-Key"}'
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        await self.app(scope, receive, send)
 
 
 # ── ASGI middleware: обход DNS rebinding protection ────────────────────────────
@@ -957,7 +1006,7 @@ def main() -> None:
         mcp_app.router.routes.append(Route("/logs", _logs_handler))
         # Оборачиваем в middleware для обхода DNS rebinding protection
         # allowed_hosts = ["localhost:*"] — нужен порт в Host заголовке
-        combined_app = _McpCompatMiddleware(mcp_app, port=port)
+        combined_app = _AuthMiddleware(_McpCompatMiddleware(mcp_app, port=port))
 
         logger.info("MCP + /logs: http://%s:%d  (транспорт: streamable-http)", host, port)
 
