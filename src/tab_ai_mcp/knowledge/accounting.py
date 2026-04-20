@@ -110,6 +110,7 @@ INSTRUCTIONS = """
     ref55 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '55'", select="Ref_Key")[0]["Ref_Key"]
 
   Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
+    ⚠ ОБЯЗАТЕЛЬНО expand="Субконто1" — без него не будет названия банковского счёта!
     rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
                      filter=f"Account_Key eq guid'{ref51}'", expand="Субконто1")
     rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
@@ -117,7 +118,10 @@ INSTRUCTIONS = """
     rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
                      filter=f"Account_Key eq guid'{ref55}'", expand="Субконто1")
 
-  Шаг 3. Итог:
+  Шаг 3. Формирование результата:
+    ⚠ НАЗВАНИЕ банковского счёта = row["Субконто1"]["Description"] (из Catalog_БанковскиеСчета)
+      НЕ путать с ChartOfAccounts.Description ("Расчётные счета") — это название СЧЁТА ПЛАНА СЧЕТОВ, не банка!
+      Каждая строка rows51/rows55 = один банковский счёт организации с остатком СуммаBalance.
     Рублёвый остаток = Σ СуммаBalance по rows51 + rows55
     Валютный остаток = rows52 сгруппировать по Валюта_Key → ВалютнаяСуммаBalance по каждой валюте
 
@@ -131,6 +135,8 @@ INSTRUCTIONS = """
                  filter=f"Account_Key eq guid'{ref}'",
                  expand="Субконто1,Субконто2")
   Остаток = СуммаBalance
+  Аналитика: row["Субконто1"]["Description"] — название объекта (контрагент, банковский счёт и т.д.)
+  ⚠ НЕ использовать ChartOfAccounts.Description как аналитику — это имя счёта плана счетов.
 
   Активный счёт (01,04,10,19,41,43,50,51,52,55,58,60.02,62): остаток = Д - К
   Пассивный (60,62.02,66,67,68,69,70,80,83,84): остаток = К - Д

@@ -623,13 +623,17 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                             ref55 = read_1c("ChartOfAccounts_Хозрасчетный",
                                             filter="Code eq '55'", select="Ref_Key")[0]["Ref_Key"]
                           Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
+                            ⚠ ОБЯЗАТЕЛЬНО expand="Субконто1" — без него нет названия банковского счёта!
                             rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
                                              filter="Account_Key eq guid'<ref51>'", expand="Субконто1")
                             rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
                                              filter="Account_Key eq guid'<ref52>'", expand="Субконто1")
                             rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
                                              filter="Account_Key eq guid'<ref55>'", expand="Субконто1")
-                          Шаг 3. Итог:
+                          Шаг 3. Формирование ответа:
+                            Название банковского счёта = row["Субконто1"]["Description"]
+                            ⚠ НЕ путать с ChartOfAccounts.Description ("Расчётные счета") —
+                              это имя счёта плана счетов, НЕ название банковского счёта!
                             Рублёвый = Σ СуммаBalance (rows51 + rows55)
                             Валютный = rows52 по Валюта_Key → ВалютнаяСуммаBalance каждой валюты
                           ═══════════════════════════════════════════════════════
@@ -687,13 +691,13 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             known_binary = frozenset(binary_map.get(entity_base, []))
             result = _strip_binary_fields(result, known_binary)
             _log_request("read_1c", query, resolved,
-                         {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
+                         {"org": organization, "filter": filter, "select": select, "expand": expand, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, rows=len(result))
             return {"value": result}
         except Exception as exc:
             err = str(exc) or f"{type(exc).__name__}"
             _log_request("read_1c", query, resolved,
-                         {"org": organization, "filter": filter, "select": select, "top": top, "skip": skip},
+                         {"org": organization, "filter": filter, "select": select, "expand": expand, "top": top, "skip": skip},
                          (time.monotonic() - t0) * 1000, error=err)
             return {"value": [], "_error": err, "_entity": resolved}
 
