@@ -670,6 +670,27 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             if query.lower().startswith(_pfx):
                 clean_query = query[len(_pfx):].strip()
                 break
+        # Детектировать вопрос пользователя переданный напрямую в query — это ошибка вызова.
+        # query должен быть именем OData сущности или кратким описанием (2-5 слов), не вопросом.
+        _QUESTION_STARTERS = (
+            "какой", "какая", "какое", "какие", "сколько", "как ", "когда",
+            "где ", "кто ", "что ", "почему", "зачем", "покажи", "выдай",
+            "дай ", "найди", "рассчитай", "посчитай", "what ", "how ", "show ",
+        )
+        lq = clean_query.lower()
+        if len(clean_query) > 40 and any(lq.startswith(s) for s in _QUESTION_STARTERS):
+            hint = (
+                "ОШИБКА ВЫЗОВА: параметр query должен быть именем OData сущности или кратким "
+                "описанием (2-5 слов), а НЕ вопросом пользователя. "
+                f"Получено: '{clean_query[:80]}'. "
+                "Правильные примеры: 'остатки по банку', 'Catalog_Контрагенты', "
+                "'AccountingRegister_Хозрасчетный/Balance(Period=datetime\\'2024-12-31T00:00:00\\')'. "
+                "Для остатков денег на дату — следуй алгоритму банковских остатков из инструкций "
+                "(ChartOfAccounts → Balance по счетам 51, 52, 55)."
+            )
+            _log_request("read_1c", query, "_query_is_user_question",
+                         {"org": organization}, 0.0, error=hint)
+            return {"value": [], "_error": hint, "_entity": "_query_is_user_question"}
         resolved = (
             clean_query if _looks_like_odata_name(clean_query) or "/" in clean_query
             else await _resolve_entity_type(clean_query, model=model, organization=organization, user_id=user_id)
