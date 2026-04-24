@@ -812,6 +812,85 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             raise
 
     @mcp.tool()
+    async def build_1c_analytics(
+        objects: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Сформировать JSON объектов 1С:Аналитика для передачи в Библиотеку 1С.
+        Build 1C:Analytics objects JSON to be passed back to the 1C library,
+        which will write them via СистемаАналитики.ПолучитьСоединение().ЗаписатьСхему().
+
+        The 1C library receives this result through the existing pipeline and writes
+        the objects itself — no HTTP calls are made from this tool.
+
+        Object structure (each item in `objects`):
+          type       : "chart" | "dashboard" | "folder" | "desktop"
+          id         : UUID string — MUST be unique, use uuid4()
+          name       : human-readable display name
+          owner      : analytics user UUID (1C will substitute actual user if empty)
+          ownerName  : analytics user name (1C will substitute if empty)
+          chartType  : (chart only) "bar" | "line" | "pie" | "table" | "doughnut" | "area"
+          data       : JSON-encoded string with chart/dashboard config (see format below)
+          updated    : Unix timestamp in milliseconds as string, e.g. "1714000000000"
+          links      : list of chart UUIDs referenced by this dashboard
+          version    : 0 for new objects
+
+        Chart `data` JSON structure:
+          {
+            "measures": [{"field": "SalesAmount", "aggregation": "sum", "label": "Продажи"}],
+            "dimensions": [{"field": "Period", "label": "Период"}],
+            "filters": [],
+            "sort": [],
+            "limit": 1000
+          }
+
+        Dashboard `data` JSON structure:
+          {
+            "widgets": [
+              {"id": "<chart_uuid>", "type": "chart", "x": 0, "y": 0, "w": 6, "h": 4}
+            ]
+          }
+
+        Args:
+            objects: List of analytics objects (charts, dashboards, etc.)
+
+        Returns:
+            {
+              "objects": [...],   — the validated objects to write (pass to 1C library as-is)
+              "ids": [...],       — list of all object UUIDs
+              "open_urls": {      — URL patterns (1C fills in actual base URL)
+                "chart": ["ans?state=/chart/<id>", ...],
+                "dashboard": ["ans?state=/dashboard/<id>", ...]
+              }
+            }
+        """
+        import time as _time
+
+        now_ms = str(int(_time.time() * 1000))
+        validated = []
+        for obj in objects:
+            o = dict(obj)
+            o.setdefault("version", 0)
+            o.setdefault("owner", "")
+            o.setdefault("ownerName", "")
+            o.setdefault("links", [])
+            if not o.get("updated"):
+                o["updated"] = now_ms
+            validated.append(o)
+
+        ids = [o.get("id", "") for o in validated if o.get("id")]
+        open_urls: dict[str, list[str]] = {}
+        for obj in validated:
+            obj_type = obj.get("type", "")
+            obj_id = obj.get("id", "")
+            if obj_type in ("chart", "dashboard") and obj_id:
+                open_urls.setdefault(obj_type, []).append(
+                    f"ans?state=/{obj_type}/{obj_id}"
+                )
+
+        return {"objects": validated, "ids": ids, "open_urls": open_urls}
+
+    @mcp.tool()
     async def count_document_marks(
         document_base64: str,
         model: Optional[str] = None,
