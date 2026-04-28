@@ -816,51 +816,125 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         objects: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """
-        Сформировать JSON объектов 1С:Аналитика для передачи в Библиотеку 1С.
-        Build 1C:Analytics objects JSON to be passed back to the 1C library,
-        which will write them via СистемаАналитики.ПолучитьСоединение().ЗаписатьСхему().
+        Сформировать JSON объектов 1С:Аналитика для записи через REST API PUT /api/ans/objects.
+        Build 1C:Analytics objects JSON ready for the 1C Analytics REST API.
 
-        The 1C library receives this result through the existing pipeline and writes
-        the objects itself — no HTTP calls are made from this tool.
+        The 1C client code calls PUT /api/ans/objects for each returned object,
+        then opens the resulting URL in an HTML field.
 
-        Object structure (each item in `objects`):
-          type       : "chart" | "dashboard" | "folder" | "desktop"
-          id         : UUID string — MUST be unique, use uuid4()
-          name       : human-readable display name
-          owner      : analytics user UUID (1C will substitute actual user if empty)
-          ownerName  : analytics user name (1C will substitute if empty)
-          chartType  : (chart only) "bar" | "line" | "pie" | "table" | "doughnut" | "area"
-          data       : JSON-encoded string with chart/dashboard config (see format below)
-          updated    : Unix timestamp in milliseconds as string, e.g. "1714000000000"
-          links      : list of chart UUIDs referenced by this dashboard
-          version    : 0 for new objects
-
-        Chart `data` JSON structure:
-          {
-            "measures": [{"field": "SalesAmount", "aggregation": "sum", "label": "Продажи"}],
-            "dimensions": [{"field": "Period", "label": "Период"}],
-            "filters": [],
-            "sort": [],
-            "limit": 1000
+        ── CHART OBJECT ────────────────────────────────────────────────────────────
+        {
+          "type"      : "chart",
+          "id"        : "<uuid4>",          // MUST be unique
+          "name"      : "Продажи по менеджерам",
+          "owner"     : "",                 // 1C will fill with actual user UUID
+          "ownerName" : "",
+          "chartType" : "barVert",          // see values below
+          "version"   : 0,
+          "updated"   : "1714000000000",    // ms since epoch as string
+          "data"      : {                   // object, NOT a JSON string
+            "database" : "УправлениеПредприятием",   // 1C IB identifier
+            "state"    : {
+              "type"       : "barVert",     // same as chartType
+              "dataSource" : {
+                "id"         : "РегистрНакопления.Продажи",   // 1C data source
+                "parameters" : {
+                  "Период" : { "periodicity": "MONTH" }       // optional
+                }
+              },
+              "fields" : [
+                {
+                  "id"         : "<hex16>",           // e.g. "a1b2c3d4e5f6a7b8"
+                  "kind"       : "measure",            // "measure"|"dimension"|"filter"|"color"
+                  "expression" : "СУММА(СуммаОборот)", // 1C Analytics expression language
+                  "role"       : ["values"],
+                  "sort"       : "none",
+                  "isActive"   : true,
+                  "title"      : "Сумма продаж"
+                },
+                {
+                  "id"         : "<hex16>",
+                  "kind"       : "dimension",
+                  "expression" : "Менеджер",
+                  "role"       : ["axisx"],
+                  "sort"       : "none",
+                  "isActive"   : true,
+                  "title"      : "Менеджер"
+                }
+              ]
+            }
           }
+        }
 
-        Dashboard `data` JSON structure:
-          {
-            "widgets": [
-              {"id": "<chart_uuid>", "type": "chart", "x": 0, "y": 0, "w": 6, "h": 4}
-            ]
+        chartType valid values (use EXACT strings):
+          "barVert"    — vertical bar chart       (наиболее частый выбор)
+          "barHor"     — horizontal bar chart
+          "barVertRel" — vertical stacked bar (%)
+          "barHorRel"  — horizontal stacked bar (%)
+          "line"       — line chart
+          "lineRel"    — relative line chart
+          "pie"        — pie chart
+          "pivottable" — pivot table
+          "indicator"  — KPI indicator (single number)
+          "bubble"     — bubble chart
+          "funnel"     — funnel chart
+          "radar"      — radar/spider chart
+          "treeMap"    — tree map
+          "speedometer"— speedometer
+          "markerMap"  — marker map
+          "areasMap"   — choropleth map
+
+        Common field roles by chartType:
+          barVert/barHor : measure → "values", dimension → "axisx"
+          line           : measure → "values", dimension → "axisx"
+          pie            : measure → "values", dimension → "pie"
+          pivottable     : measure → "values", dimension → "vgroups" or "hgroups"
+          indicator      : measure → "indicator"
+
+        Common expression examples (1C Analytics language):
+          "СУММА(СуммаОборот)"                  — sum of a numeric field
+          "КОЛИЧЕСТВО(Ссылка)"                   — record count
+          "Менеджер"                             — dimension field (group by)
+          "ИЗВЛЕЧЬ(Период, МЕСЯЦ)"               — extract month from date
+          "ИЗВЛЕЧЬ(Период, ГОД)"                 — extract year
+
+        ── DASHBOARD OBJECT ────────────────────────────────────────────────────────
+        {
+          "type"    : "dashboard",
+          "id"      : "<uuid4>",
+          "name"    : "Дашборд продаж",
+          "owner"   : "",
+          "ownerName": "",
+          "version" : 0,
+          "updated" : "1714000000000",
+          "data"    : {
+            "widgets" : [
+              {
+                "id"      : "<widget-local-id>",   // local ID within dashboard
+                "type"    : "chart",
+                "chartId" : "<chart-uuid>",        // global chart UUID (from chart object)
+                "showOutline": false
+              }
+            ],
+            "layouts" : {
+              "desktop" : [
+                { "i": "<widget-local-id>", "x": 0, "y": 0, "w": 12, "h": 6 }
+              ]
+            }
           }
+        }
 
         Args:
-            objects: List of analytics objects (charts, dashboards, etc.)
+            objects: List of analytics objects (charts and/or dashboards).
+                     Always include the dashboard AFTER all its charts.
 
         Returns:
             {
-              "objects": [...],   — the validated objects to write (pass to 1C library as-is)
-              "ids": [...],       — list of all object UUIDs
-              "open_urls": {      — URL patterns (1C fills in actual base URL)
-                "chart": ["ans?state=/chart/<id>", ...],
-                "dashboard": ["ans?state=/dashboard/<id>", ...]
+              "objects"   : [...],  — validated objects, pass each to PUT /api/ans/objects
+              "ids"       : [...],  — all object UUIDs
+              "open_urls" : {
+                "chart"     : ["ans?state=/chart/<id>", ...],
+                "dashboard" : ["ans?state=/dashboard/<id>", ...]
               }
             }
         """
