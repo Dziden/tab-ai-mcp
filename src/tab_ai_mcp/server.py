@@ -675,12 +675,24 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         # Детектировать вопрос пользователя переданный напрямую в query — это ошибка вызова.
         # query должен быть именем OData сущности или кратким описанием (2-5 слов), не вопросом.
         _QUESTION_STARTERS = (
-            "какой", "какая", "какое", "какие", "сколько", "как ", "когда",
-            "где ", "кто ", "что ", "почему", "зачем", "покажи", "выдай",
-            "дай ", "найди", "рассчитай", "посчитай", "what ", "how ", "show ",
+            "какой", "какая", "какое", "какие", "какова", "каков ", "каково",
+            "сколько", "как ", "когда", "где ", "кто ", "что ", "почему", "зачем",
+            "покажи", "выдай", "дай ", "найди", "рассчитай", "посчитай",
+            "сравни", "сопостав", "проанализируй", "выведи", "посмотри",
+            "топ-", "топ ", "what ", "how ", "show ", "list ",
         )
         lq = clean_query.lower()
-        if len(clean_query) > 40 and any(lq.startswith(s) for s in _QUESTION_STARTERS):
+        _word_count = len(clean_query.split())
+        _is_question = (
+            # Начинается с вопросного/императивного слова
+            (len(clean_query) > 25 and any(lq.startswith(s) for s in _QUESTION_STARTERS))
+            # Заканчивается "?" и похоже на вопрос (>= 5 слов)
+            or (clean_query.strip().endswith("?") and _word_count >= 5)
+            # Слишком длинная фраза без "/", "(", "eq ", "guid" — явно не OData
+            or (_word_count >= 8 and "/" not in clean_query and "(" not in clean_query
+                and "eq " not in clean_query and "guid" not in clean_query.lower())
+        )
+        if _is_question:
             hint = (
                 "ОШИБКА ВЫЗОВА: параметр query должен быть именем OData сущности или кратким "
                 "описанием (2-5 слов), а НЕ вопросом пользователя. "
