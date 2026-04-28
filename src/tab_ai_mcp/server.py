@@ -814,13 +814,17 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
     @mcp.tool()
     async def build_1c_analytics(
         objects: list[dict[str, Any]],
+        analytics_url: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Сформировать JSON объектов 1С:Аналитика для записи через REST API PUT /api/ans/objects.
-        Build 1C:Analytics objects JSON ready for the 1C Analytics REST API.
+        Сформировать объекты 1С:Аналитика и записать их напрямую через REST API.
+        Build 1C:Analytics objects and write them directly via REST API PUT /api/ans/objects.
 
-        The 1C client code calls PUT /api/ans/objects for each returned object,
-        then opens the resulting URL in an HTML field.
+        If analytics_url is provided, this tool writes each object to the analytics server
+        itself and returns full open_urls ready to open in an HTML field — no extra HTTP
+        calls needed from the 1C client side.
+
+        If analytics_url is omitted, returns the objects for the 1C client to write.
 
         ── CHART OBJECT ────────────────────────────────────────────────────────────
         {
@@ -927,14 +931,33 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         Args:
             objects: List of analytics objects (charts and/or dashboards).
                      Always include the dashboard AFTER all its charts.
+            analytics_url: Base URL of the 1C Analytics server, e.g.
+                           "https://cloud1.tab9.ru/4d0ea919c7c712de97348cde72ea9e5f".
+                           When provided, the tool writes all objects via
+                           PUT {analytics_url}/api/ans/objects and returns full URLs.
+                           When omitted, objects are returned for the client to write.
 
         Returns:
+            When analytics_url is provided (objects written by this tool):
             {
-              "objects"   : [...],  — validated objects, pass each to PUT /api/ans/objects
-              "ids"       : [...],  — all object UUIDs
-              "open_urls" : {
-                "chart"     : ["ans?state=/chart/<id>", ...],
-                "dashboard" : ["ans?state=/dashboard/<id>", ...]
+              "written"   : true,
+              "ids"       : [...],     — all object UUIDs written
+              "open_url"  : "https://.../<base>/ans?state=/dashboard/<id>",
+              "open_urls" : {          — full URLs, dashboard first
+                "dashboard" : ["https://.../ans?state=/dashboard/<id>"],
+                "chart"     : ["https://.../ans?state=/chart/<id>"]
+              },
+              "errors"    : []         — list of write errors (empty on full success)
+            }
+
+            When analytics_url is omitted (client writes the objects):
+            {
+              "written"   : false,
+              "objects"   : [...],     — pass each to PUT /api/ans/objects
+              "ids"       : [...],
+              "open_urls" : {          — relative URL patterns
+                "chart"     : ["ans?state=/chart/<id>"],
+                "dashboard" : ["ans?state=/dashboard/<id>"]
               }
             }
         """
@@ -953,16 +976,63 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             validated.append(o)
 
         ids = [o.get("id", "") for o in validated if o.get("id")]
-        open_urls: dict[str, list[str]] = {}
+
+        # Build relative open_urls (always included)
+        rel_open_urls: dict[str, list[str]] = {}
         for obj in validated:
             obj_type = obj.get("type", "")
             obj_id = obj.get("id", "")
             if obj_type in ("chart", "dashboard") and obj_id:
-                open_urls.setdefault(obj_type, []).append(
+                rel_open_urls.setdefault(obj_type, []).append(
                     f"ans?state=/{obj_type}/{obj_id}"
                 )
 
-        return {"objects": validated, "ids": ids, "open_urls": open_urls}
+        # If no analytics_url provided — just return objects for client to write
+        base_url = str(analytics_url or "").rstrip("/")
+        if not base_url:
+            return {"written": False, "objects": validated, "ids": ids, "open_urls": rel_open_urls}
+
+        # Write each object directly to the analytics server
+        api_endpoint = f"{base_url}/api/ans/objects"
+        errors: list[str] = []
+
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            for obj in validated:
+                try:
+                    resp = await client.put(
+                        api_endpoint,
+                        json=obj,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    if resp.status_code != 200:
+                        errors.append(
+                            f"Object {obj.get('id')} (type={obj.get('type')}): "
+                            f"HTTP {resp.status_code} — {resp.text[:300]}"
+                        )
+                except Exception as exc:
+                    errors.append(f"Object {obj.get('id')}: {exc}")
+
+        # Build full open_urls
+        full_open_urls: dict[str, list[str]] = {
+            obj_type: [f"{base_url}/{rel}" for rel in rels]
+            for obj_type, rels in rel_open_urls.items()
+        }
+
+        # Primary URL: dashboard first, then chart
+        open_url = ""
+        for obj_type in ("dashboard", "chart"):
+            urls = full_open_urls.get(obj_type, [])
+            if urls:
+                open_url = urls[0]
+                break
+
+        return {
+            "written": not bool(errors),
+            "ids": ids,
+            "open_url": open_url,
+            "open_urls": full_open_urls,
+            "errors": errors,
+        }
 
     @mcp.tool()
     async def count_document_marks(
