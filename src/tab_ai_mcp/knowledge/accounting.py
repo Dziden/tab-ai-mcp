@@ -122,21 +122,35 @@ INSTRUCTIONS = """
     ✓ ref51 будет выглядеть как "9781b3db-cc0d-11e5-9653-3085a93ddca2" — настоящий UUID, не '51'!
 
   Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
-    ⚠ ОБЯЗАТЕЛЬНО expand="Субконто1" — без него не будет названия банковского счёта!
     ⚠ Period = дата из вопроса (например 2024-12-31), НЕ текущая дата!
+    ⚠ НЕ использовать expand="Субконто1" — такого поля нет, будет HTTP 400!
+       Субконто доступны как ExtDimension1 (GUID), ExtDimension1_Type (тип справочника).
+       Для названия банковского счёта — отдельный lookup по ExtDimension1.
     rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                     filter=f"Account_Key eq guid'{ref51}'", expand="Субконто1")
+                     filter=f"Account_Key eq guid'{ref51}'")
     rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                     filter=f"Account_Key eq guid'{ref52}'", expand="Субконто1")
+                     filter=f"Account_Key eq guid'{ref52}'")
     rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                     filter=f"Account_Key eq guid'{ref55}'", expand="Субконто1")
+                     filter=f"Account_Key eq guid'{ref55}'")
 
   Шаг 3. Формирование результата:
-    ⚠ НАЗВАНИЕ банковского счёта = row["Субконто1"]["Description"] (из Catalog_БанковскиеСчета)
-      НЕ путать с ChartOfAccounts.Description ("Расчётные счета") — это название СЧЁТА ПЛАНА СЧЕТОВ, не банка!
-      Каждая строка rows51/rows55 = один банковский счёт организации с остатком СуммаBalance.
-    Рублёвый остаток = Σ СуммаBalance по rows51 + rows55
-    Валютный остаток = rows52 сгруппировать по Валюта_Key → ВалютнаяСуммаBalance по каждой валюте
+    ⚠ КРИТИЧНО: счёт 52 имеет ДВА значения остатка — не путать!
+      row["СуммаBalance"]          → рублёвый ЭКВИВАЛЕНТ валюты (НЕ реальные рубли!)
+      row["ВалютнаяСуммаBalance"]  → реальная сумма в иностранной валюте ✓
+
+    ❌ НЕЛЬЗЯ: "рублёвый остаток = СуммаBalance(51) + СуммаBalance(52) + СуммаBalance(55)"
+       Это даст НЕВЕРНУЮ цифру — включит рублёвый эквивалент валюты как реальные рубли!
+
+    ✓ ПРАВИЛЬНО:
+      Рублёвый остаток = Σ СуммаBalance по rows51 + Σ СуммаBalance по rows55
+                         (счёт 52 ИСКЛЮЧИТЬ из рублёвого итога!)
+      Валютный остаток = rows52 → сгруппировать по Валюта_Key → ВалютнаяСуммаBalance по каждой валюте
+      Рублёвый эквивалент валюты (справочно) = Σ СуммаBalance по rows52
+
+    ⚠ НАЗВАНИЕ банковского счёта:
+      Каждая строка = один банковский счёт. Субконто в поле ExtDimension1 = GUID счёта.
+      Lookup: read_1c("Catalog_БанковскиеСчета", filter=f"Ref_Key eq guid'{row['ExtDimension1']}'", select="Description")
+      НЕ путать с ChartOfAccounts.Description ("Расчётные счета") — это имя счёта плана счетов!
 
   Важно: ChartOfAccounts НЕ поддерживает 'or' в filter — делать отдельный запрос для каждого счета.
   Пример: Code eq '51' — работает. Code eq '51' or Code eq '52' — НЕ работает (500 ошибка).
@@ -150,10 +164,13 @@ INSTRUCTIONS = """
 
   ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq 'XX'", select="Ref_Key")[0]["Ref_Key"]
   rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                 filter=f"Account_Key eq guid'{ref}'",
-                 expand="Субконто1,Субконто2")
+                 filter=f"Account_Key eq guid'{ref}'"
+                 # НЕ добавлять expand="Субконто1" — такого поля нет, будет HTTP 400!
+                 )
   Остаток = СуммаBalance
-  Аналитика: row["Субконто1"]["Description"] — название объекта (контрагент, банковский счёт и т.д.)
+  Аналитика: субконто доступны в полях ExtDimension1, ExtDimension2 (содержат GUID).
+    Тип: row["ExtDimension1_Type"] → "StandardODATA.Catalog_Контрагенты" и т.д.
+    Название: отдельный lookup: read_1c("Catalog_Контрагенты", filter=f"Ref_Key eq guid'{row['ExtDimension1']}'", select="Description")
   ⚠ НЕ использовать ChartOfAccounts.Description как аналитику — это имя счёта плана счетов.
 
   Активный счёт (01,04,10,19,41,43,50,51,52,55,58,60.02,62): остаток = Д - К
