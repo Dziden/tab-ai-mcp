@@ -103,14 +103,27 @@ INSTRUCTIONS = """
 
 ⚠ ОСТАТОК ПО БАНКУ — запрашивать ВСЕ ТРИ счёта: 51, 52, 55 (НЕ только 51!):
 
+  ❌ ТИПИЧНЫЕ ОШИБКИ — НИКОГДА ТАК НЕ ДЕЛАТЬ:
+    filter="Account_Key eq guid'51'"   ← '51' это КОД счёта, не GUID!
+    filter="Account_Key eq guid'52'"   ← то же самое — 400 ошибка!
+    filter="Account_Key eq guid'55'"   ← GUID выглядит как 9781b3db-cc0d-11e5-9653-3085a93ddca2
+    Period=datetime'2026-04-21T...'    ← НЕ подставлять текущую дату! Дата берётся из вопроса.
+
+  Шаг 0 (КРИТИЧНО). Определить дату из вопроса пользователя:
+    "на конец 2024 года" → YYYY-MM-DD = 2024-12-31
+    "на 01.09.2025"      → YYYY-MM-DD = 2025-09-01
+    ❌ НЕ использовать текущую дату как Period!
+
   Шаг 1. Для каждого счёта — ОТДЕЛЬНЫЙ запрос (ChartOfAccounts не поддерживает 'or'!):
     ⚠ ОБЯЗАТЕЛЬНО указывать select="Ref_Key" — без него запрос возвращает все поля и может зависнуть!
     ref51 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '51'", select="Ref_Key")[0]["Ref_Key"]
     ref52 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '52'", select="Ref_Key")[0]["Ref_Key"]
     ref55 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '55'", select="Ref_Key")[0]["Ref_Key"]
+    ✓ ref51 будет выглядеть как "9781b3db-cc0d-11e5-9653-3085a93ddca2" — настоящий UUID, не '51'!
 
   Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
     ⚠ ОБЯЗАТЕЛЬНО expand="Субконто1" — без него не будет названия банковского счёта!
+    ⚠ Period = дата из вопроса (например 2024-12-31), НЕ текущая дата!
     rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
                      filter=f"Account_Key eq guid'{ref51}'", expand="Субконто1")
     rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
@@ -129,6 +142,11 @@ INSTRUCTIONS = """
   Пример: Code eq '51' — работает. Code eq '51' or Code eq '52' — НЕ работает (500 ошибка).
 
 Алгоритм остатка по произвольному счёту на дату:
+
+  ⚠ ДАТА ДЛЯ PERIOD берётся из вопроса пользователя:
+    "на конец 2024 года"   → 2024-12-31T00:00:00
+    "на конец квартала Q3 2025" → 2025-09-30T00:00:00
+    ❌ НЕ использовать текущую системную дату!
 
   ref = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq 'XX'", select="Ref_Key")[0]["Ref_Key"]
   rows = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
@@ -153,6 +171,11 @@ INSTRUCTIONS = """
     ВСЕГДА сначала получать Ref_Key через ChartOfAccounts_Хозрасчетный:
     ref9001 = read_1c("ChartOfAccounts_Хозрасчетный", filter="Code eq '90.01'", select="Ref_Key")[0]["Ref_Key"]
     Затем: filter=f"Account_Key eq guid'{ref9001}'"  ← вот так, с реальным GUID
+    Реальный GUID выглядит как "9781b3db-cc0d-11e5-9653-3085a93ddca2", а не как "51" или "90.01"!
+
+  ⚠ Period в Balance/Turnovers — ВСЕГДА дата из вопроса пользователя, НЕ текущая дата:
+    ❌ Period=datetime'2026-04-21T14:43:23'  ← текущая дата — ОШИБКА!
+    ✓  Period=datetime'2024-12-31T00:00:00'  ← конец 2024 года — ПРАВИЛЬНО
 
   Структура счёта 90 (важно для правильного расчёта выручки):
     90.01 — Выручка             (кредит: СуммаCrTurnover)
