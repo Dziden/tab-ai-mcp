@@ -827,16 +827,33 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
     @mcp.tool()
     async def build_1c_analytics(
-        objects: list[dict[str, Any]],
         analytics_url: Optional[str] = None,
+        objects: Optional[list[dict[str, Any]]] = None,
+        query: Optional[str] = None,
+        organization: str = "",
+        user_id: str = "",
+        login: Optional[str] = None,
+        password: Optional[str] = None,
+        verify_ssl: Optional[bool] = None,
     ) -> dict[str, Any]:
         """
         Сформировать объекты 1С:Аналитика и записать их напрямую через REST API.
-        Build 1C:Analytics objects and write them directly via REST API PUT /api/ans/objects.
+        Build 1C:Analytics objects and write them directly via REST API PUT /ans/api/ans/objects.
 
-        If analytics_url is provided, this tool writes each object to the analytics server
-        itself and returns full open_urls ready to open in an HTML field — no extra HTTP
-        calls needed from the 1C client side.
+        Two usage modes:
+        1. Pass ready-made ``objects`` list (charts + optional dashboard).
+        2. Pass a natural-language ``query`` — the tool generates analytics objects automatically.
+
+        If analytics_url is provided the tool writes each object to the analytics server via
+        PUT {analytics_url}/ans/api/ans/objects and returns full open_urls ready to open in
+        an HTML field — no extra HTTP calls needed from the 1C client side.
+
+        The analytics_url must be the 1C IB base URL (same root as odata_base_url but
+        without the /odata/standard.odata suffix), e.g.:
+            "https://cloud1.tab9.ru/4d0ea919c7c712de97348cde72ea9e5f"
+
+        The API endpoint is constructed as: {analytics_url}/ans/api/ans/objects
+        The open URL is constructed as:    {analytics_url}/ans?state=/{type}/{id}
 
         If analytics_url is omitted, returns the objects for the 1C client to write.
 
@@ -845,39 +862,39 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
           "type"      : "chart",
           "id"        : "<uuid4>",          // MUST be unique
           "name"      : "Продажи по менеджерам",
-          "owner"     : "",                 // 1C will fill with actual user UUID
+          "owner"     : "",
           "ownerName" : "",
           "chartType" : "barVert",          // see values below
           "version"   : 0,
           "updated"   : "1714000000000",    // ms since epoch as string
-          "data"      : {                   // object, NOT a JSON string
-            "database" : "УправлениеПредприятием",   // 1C IB identifier
+          "data"      : {
+            "database" : "",                // leave empty — server fills it
             "state"    : {
-              "type"       : "barVert",     // same as chartType
+              "type"       : "barVert",
               "dataSource" : {
-                "id"         : "РегистрНакопления.Продажи",   // 1C data source
+                "id"         : "РегистрНакопления.РеализацияУслуг",
                 "parameters" : {
-                  "Период" : { "periodicity": "MONTH" }       // optional
+                  "Период" : { "periodicity": "MONTH" }
                 }
               },
               "fields" : [
                 {
-                  "id"         : "<hex16>",           // e.g. "a1b2c3d4e5f6a7b8"
-                  "kind"       : "measure",            // "measure"|"dimension"|"filter"|"color"
-                  "expression" : "СУММА(СуммаОборот)", // 1C Analytics expression language
+                  "id"         : "a1b2c3d4e5f6a7b8",
+                  "kind"       : "measure",
+                  "expression" : "СУММА(Сумма)",
                   "role"       : ["values"],
                   "sort"       : "none",
                   "isActive"   : true,
-                  "title"      : "Сумма продаж"
+                  "title"      : "Выручка"
                 },
                 {
-                  "id"         : "<hex16>",
+                  "id"         : "b2c3d4e5f6a7b8c9",
                   "kind"       : "dimension",
-                  "expression" : "Менеджер",
+                  "expression" : "Период",
                   "role"       : ["axisx"],
                   "sort"       : "none",
                   "isActive"   : true,
-                  "title"      : "Менеджер"
+                  "title"      : "Месяц"
                 }
               ]
             }
@@ -909,11 +926,15 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
           pivottable     : measure → "values", dimension → "vgroups" or "hgroups"
           indicator      : measure → "indicator"
 
+        Known 1C data sources (Бухгалтерия 3.0):
+          РегистрНакопления.РеализацияУслуг  — revenue/sales (fields: Сумма, Период)
+          РегистрНакопления.ВыпускПродукцииУслуг  — production
+
         Common expression examples (1C Analytics language):
-          "СУММА(СуммаОборот)"                  — sum of a numeric field
+          "СУММА(Сумма)"                        — sum revenue
           "КОЛИЧЕСТВО(Ссылка)"                   — record count
-          "Менеджер"                             — dimension field (group by)
-          "ИЗВЛЕЧЬ(Период, МЕСЯЦ)"               — extract month from date
+          "Период"                               — date dimension (use with periodicity)
+          "ИЗВЛЕЧЬ(Период, МЕСЯЦ)"               — extract month
           "ИЗВЛЕЧЬ(Период, ГОД)"                 — extract year
 
         ── DASHBOARD OBJECT ────────────────────────────────────────────────────────
@@ -927,59 +948,122 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
           "updated" : "1714000000000",
           "data"    : {
             "widgets" : [
-              {
-                "id"      : "<widget-local-id>",   // local ID within dashboard
-                "type"    : "chart",
-                "chartId" : "<chart-uuid>",        // global chart UUID (from chart object)
-                "showOutline": false
-              }
+              { "id": "w1", "type": "chart", "chartId": "<chart-uuid>", "showOutline": false }
             ],
             "layouts" : {
-              "desktop" : [
-                { "i": "<widget-local-id>", "x": 0, "y": 0, "w": 12, "h": 6 }
-              ]
+              "desktop" : [{ "i": "w1", "x": 0, "y": 0, "w": 12, "h": 6 }]
             }
           }
         }
 
         Args:
-            objects: List of analytics objects (charts and/or dashboards).
-                     Always include the dashboard AFTER all its charts.
-            analytics_url: Base URL of the 1C Analytics server, e.g.
+            analytics_url: Base 1C IB URL (without /odata/... suffix), e.g.
                            "https://cloud1.tab9.ru/4d0ea919c7c712de97348cde72ea9e5f".
-                           When provided, the tool writes all objects via
-                           PUT {analytics_url}/api/ans/objects and returns full URLs.
-                           When omitted, objects are returned for the client to write.
-
-        Returns:
-            When analytics_url is provided (objects written by this tool):
-            {
-              "written"   : true,
-              "ids"       : [...],     — all object UUIDs written
-              "open_url"  : "https://.../<base>/ans?state=/dashboard/<id>",
-              "open_urls" : {          — full URLs, dashboard first
-                "dashboard" : ["https://.../ans?state=/dashboard/<id>"],
-                "chart"     : ["https://.../ans?state=/chart/<id>"]
-              },
-              "errors"    : []         — list of write errors (empty on full success)
-            }
-
-            When analytics_url is omitted (client writes the objects):
-            {
-              "written"   : false,
-              "objects"   : [...],     — pass each to PUT /api/ans/objects
-              "ids"       : [...],
-              "open_urls" : {          — relative URL patterns
-                "chart"     : ["ans?state=/chart/<id>"],
-                "dashboard" : ["ans?state=/dashboard/<id>"]
-              }
-            }
+                           API endpoint: {url}/ans/api/ans/objects
+            objects: List of analytics objects. If omitted, auto-generated from query.
+            query: Natural language description when objects not provided.
+            organization: 1C organisation name (can be empty).
+            user_id: User identifier for tracking.
+            login: 1C credentials login (uses env ONEC_USERNAME if omitted).
+            password: 1C credentials password (uses env ONEC_PASSWORD if omitted).
+            verify_ssl: SSL verification (default True).
         """
         import time as _time
+        import uuid as _uuid
 
         now_ms = str(int(_time.time() * 1000))
-        validated = []
-        for obj in objects:
+
+        # ── Auto-generate objects from query if not provided ─────────────────────
+        if not objects and query:
+            q = (query or "").lower()
+            chart_id = str(_uuid.uuid4())
+            dash_id = str(_uuid.uuid4())
+
+            # Determine chart type and data source from query keywords
+            if any(w in q for w in ["выручк", "реализац", "продаж", "revenue", "sales"]):
+                data_source = "РегистрНакопления.РеализацияУслуг"
+                measure_expr = "СУММА(Сумма)"
+                measure_title = "Выручка"
+                chart_name = "Динамика выручки"
+            elif any(w in q for w in ["выпуск", "производ", "production"]):
+                data_source = "РегистрНакопления.ВыпускПродукцииУслуг"
+                measure_expr = "СУММА(Сумма)"
+                measure_title = "Выпуск"
+                chart_name = "Динамика выпуска"
+            else:
+                data_source = "РегистрНакопления.РеализацияУслуг"
+                measure_expr = "СУММА(Сумма)"
+                measure_title = "Сумма"
+                chart_name = query[:60] if query else "Аналитика"
+
+            chart_type = "barVert"
+            if any(w in q for w in ["линия", "line", "динамик", "тренд", "trend"]):
+                chart_type = "line"
+
+            chart_obj: dict[str, Any] = {
+                "type": "chart",
+                "id": chart_id,
+                "name": chart_name,
+                "owner": "",
+                "ownerName": "",
+                "chartType": chart_type,
+                "version": 0,
+                "updated": now_ms,
+                "data": {
+                    "database": "",
+                    "state": {
+                        "type": chart_type,
+                        "dataSource": {
+                            "id": data_source,
+                            "parameters": {
+                                "Период": {"periodicity": "MONTH"}
+                            },
+                        },
+                        "fields": [
+                            {
+                                "id": "a1b2c3d4e5f6a7b8",
+                                "kind": "measure",
+                                "expression": measure_expr,
+                                "role": ["values"],
+                                "sort": "none",
+                                "isActive": True,
+                                "title": measure_title,
+                            },
+                            {
+                                "id": "b2c3d4e5f6a7b8c9",
+                                "kind": "dimension",
+                                "expression": "Период",
+                                "role": ["axisx"],
+                                "sort": "none",
+                                "isActive": True,
+                                "title": "Период",
+                            },
+                        ],
+                    },
+                },
+            }
+            dashboard_obj: dict[str, Any] = {
+                "type": "dashboard",
+                "id": dash_id,
+                "name": chart_name,
+                "owner": "",
+                "ownerName": "",
+                "version": 0,
+                "updated": now_ms,
+                "data": {
+                    "widgets": [
+                        {"id": "w1", "type": "chart", "chartId": chart_id, "showOutline": False}
+                    ],
+                    "layouts": {
+                        "desktop": [{"i": "w1", "x": 0, "y": 0, "w": 12, "h": 6}]
+                    },
+                },
+            }
+            objects = [chart_obj, dashboard_obj]
+
+        # ── Validate and fill defaults ───────────────────────────────────────────
+        validated: list[dict[str, Any]] = []
+        for obj in (objects or []):
             o = dict(obj)
             o.setdefault("version", 0)
             o.setdefault("owner", "")
@@ -991,7 +1075,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
 
         ids = [o.get("id", "") for o in validated if o.get("id")]
 
-        # Build relative open_urls (always included)
+        # ── Build relative open_urls (always included) ───────────────────────────
         rel_open_urls: dict[str, list[str]] = {}
         for obj in validated:
             obj_type = obj.get("type", "")
@@ -1006,11 +1090,19 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         if not base_url:
             return {"written": False, "objects": validated, "ids": ids, "open_urls": rel_open_urls}
 
-        # Write each object directly to the analytics server
-        api_endpoint = f"{base_url}/api/ans/objects"
+        # ── Write each object to the analytics server ────────────────────────────
+        # API endpoint: {base_url}/ans/api/ans/objects
+        # Open URL:     {base_url}/ans?state=/{type}/{id}
+        api_endpoint = f"{base_url}/ans/api/ans/objects"
         errors: list[str] = []
 
-        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+        # Resolve credentials
+        _login = str(login or "").strip() or (ONEC_USERNAME or "")
+        _password = str(password or "").strip() or (ONEC_PASSWORD or "")
+        _verify = bool(verify_ssl) if verify_ssl is not None else True
+        _auth = (_login, _password) if _login else None
+
+        async with httpx.AsyncClient(timeout=30.0, verify=_verify, auth=_auth) as client:
             for obj in validated:
                 try:
                     resp = await client.put(
@@ -1026,7 +1118,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                 except Exception as exc:
                     errors.append(f"Object {obj.get('id')}: {exc}")
 
-        # Build full open_urls
+        # ── Build full open_urls: {base_url}/{rel} = {base_url}/ans?state=/... ───
         full_open_urls: dict[str, list[str]] = {
             obj_type: [f"{base_url}/{rel}" for rel in rels]
             for obj_type, rels in rel_open_urls.items()
