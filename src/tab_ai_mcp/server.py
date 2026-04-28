@@ -828,6 +828,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
     @mcp.tool()
     async def build_1c_analytics(
         analytics_url: Optional[str] = None,
+        database: Optional[str] = None,
         objects: Optional[list[dict[str, Any]]] = None,
         query: Optional[str] = None,
         organization: str = "",
@@ -837,23 +838,25 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         verify_ssl: Optional[bool] = None,
     ) -> dict[str, Any]:
         """
-        Сформировать объекты 1С:Аналитика и записать их напрямую через REST API.
-        Build 1C:Analytics objects and write them directly via REST API PUT /ans/api/ans/objects.
+        Сформировать объекты 1С:Аналитика и записать их на сервер аналитики через REST API.
+        Build 1C:Analytics objects and write them to the analytics server via REST API PUT /api/ans/objects.
 
         Two usage modes:
         1. Pass ready-made ``objects`` list (charts + optional dashboard).
         2. Pass a natural-language ``query`` — the tool generates analytics objects automatically.
 
-        If analytics_url is provided the tool writes each object to the analytics server via
-        PUT {analytics_url}/ans/api/ans/objects and returns full open_urls ready to open in
-        an HTML field — no extra HTTP calls needed from the 1C client side.
+        Architecture:
+          1С:Аналитика — это ОТДЕЛЬНЫЙ сервер (Node.js), не 1С-инфобаза.
+          analytics_url — это URL именно сервера аналитики, например:
+              "http://ans.tab9.ru:8181"
+          database — идентификатор базы данных (application name) в сервере аналитики, например:
+              "acc_gazprom_demo"
 
-        The analytics_url must be the 1C IB base URL (same root as odata_base_url but
-        without the /odata/standard.odata suffix), e.g.:
-            "https://cloud1.tab9.ru/4d0ea919c7c712de97348cde72ea9e5f"
+          API endpoint:  PUT {analytics_url}/api/ans/objects
+          Viewer URL:    {analytics_url}/applications/{database}/ans?state=/{type}/{id}
 
-        The API endpoint is constructed as: {analytics_url}/ans/api/ans/objects
-        The open URL is constructed as:    {analytics_url}/ans?state=/{type}/{id}
+          Аутентификация: Basic auth — login=identifier, password=key
+          (идентификатор и ключ из настроек подключения 1С к серверу аналитики)
 
         If analytics_url is omitted, returns the objects for the 1C client to write.
 
@@ -868,7 +871,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
           "version"   : 0,
           "updated"   : "1714000000000",    // ms since epoch as string
           "data"      : {
-            "database" : "",                // leave empty — server fills it
+            "database" : "acc_gazprom_demo", // application name on analytics server
             "state"    : {
               "type"       : "barVert",
               "dataSource" : {
@@ -957,21 +960,23 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
         }
 
         Args:
-            analytics_url: Base 1C IB URL (without /odata/... suffix), e.g.
-                           "https://cloud1.tab9.ru/4d0ea919c7c712de97348cde72ea9e5f".
-                           API endpoint: {url}/ans/api/ans/objects
+            analytics_url: URL сервера 1С:Аналитика, например "http://ans.tab9.ru:8181".
+                           API endpoint: {url}/api/ans/objects
+            database: Идентификатор приложения/базы на сервере аналитики, например "acc_gazprom_demo".
+                      Используется в data.database и для построения viewer URL.
             objects: List of analytics objects. If omitted, auto-generated from query.
             query: Natural language description when objects not provided.
             organization: 1C organisation name (can be empty).
             user_id: User identifier for tracking.
-            login: 1C credentials login (uses env ONEC_USERNAME if omitted).
-            password: 1C credentials password (uses env ONEC_PASSWORD if omitted).
+            login: Идентификатор (identifier) для аутентификации на сервере аналитики.
+            password: Ключ (key/secret) для аутентификации на сервере аналитики.
             verify_ssl: SSL verification (default True).
         """
         import time as _time
         import uuid as _uuid
 
         now_ms = str(int(_time.time() * 1000))
+        _db = str(database or "").strip()
 
         # ── Auto-generate objects from query if not provided ─────────────────────
         if not objects and query:
@@ -1010,7 +1015,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                 "version": 0,
                 "updated": now_ms,
                 "data": {
-                    "database": "",
+                    "database": _db,
                     "state": {
                         "type": chart_type,
                         "dataSource": {
@@ -1071,18 +1076,30 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             o.setdefault("links", [])
             if not o.get("updated"):
                 o["updated"] = now_ms
+            # Fill database in data if provided and not set
+            if _db and isinstance(o.get("data"), dict) and not o["data"].get("database"):
+                o["data"] = dict(o["data"])
+                o["data"]["database"] = _db
             validated.append(o)
 
         ids = [o.get("id", "") for o in validated if o.get("id")]
 
-        # ── Build relative open_urls (always included) ───────────────────────────
+        # ── Build viewer open_urls ───────────────────────────────────────────────
+        # Format: {analytics_url}/applications/{database}/ans?state=/{type}/{id}
+        # Fallback (no database): {analytics_url}/ans?state=/{type}/{id}
+        def _open_url(base: str, obj_type: str, obj_id: str) -> str:
+            if _db:
+                return f"{base}/applications/{_db}/ans?state=/{obj_type}/{obj_id}"
+            return f"{base}/ans?state=/{obj_type}/{obj_id}"
+
         rel_open_urls: dict[str, list[str]] = {}
         for obj in validated:
             obj_type = obj.get("type", "")
             obj_id = obj.get("id", "")
             if obj_type in ("chart", "dashboard") and obj_id:
                 rel_open_urls.setdefault(obj_type, []).append(
-                    f"ans?state=/{obj_type}/{obj_id}"
+                    f"applications/{_db}/ans?state=/{obj_type}/{obj_id}" if _db
+                    else f"ans?state=/{obj_type}/{obj_id}"
                 )
 
         # If no analytics_url provided — just return objects for client to write
@@ -1091,14 +1108,13 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             return {"written": False, "objects": validated, "ids": ids, "open_urls": rel_open_urls}
 
         # ── Write each object to the analytics server ────────────────────────────
-        # API endpoint: {base_url}/ans/api/ans/objects
-        # Open URL:     {base_url}/ans?state=/{type}/{id}
-        api_endpoint = f"{base_url}/ans/api/ans/objects"
+        # API endpoint: {base_url}/api/ans/objects  (swagger: PUT /api/ans/objects)
+        api_endpoint = f"{base_url}/api/ans/objects"
         errors: list[str] = []
 
-        # Resolve credentials
-        _login = str(login or "").strip() or (ONEC_USERNAME or "")
-        _password = str(password or "").strip() or (ONEC_PASSWORD or "")
+        # Resolve credentials: login=identifier, password=key
+        _login = str(login or "").strip() or os.environ.get("ONEC_USERNAME", "")
+        _password = str(password or "").strip() or os.environ.get("ONEC_PASSWORD", "")
         _verify = bool(verify_ssl) if verify_ssl is not None else True
         _auth = (_login, _password) if _login else None
 
@@ -1110,18 +1126,29 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                         json=obj,
                         headers={"Content-Type": "application/json"},
                     )
+                    ct = resp.headers.get("content-type", "")
                     if resp.status_code != 200:
                         errors.append(
                             f"Object {obj.get('id')} (type={obj.get('type')}): "
                             f"HTTP {resp.status_code} — {resp.text[:300]}"
                         )
+                    elif "application/json" not in ct and "text/plain" not in ct:
+                        # Got HTML instead of JSON — likely SPA nginx fallback, not real success
+                        errors.append(
+                            f"Object {obj.get('id')} (type={obj.get('type')}): "
+                            f"Unexpected Content-Type '{ct}' — expected JSON. "
+                            f"Body: {resp.text[:200]}"
+                        )
                 except Exception as exc:
                     errors.append(f"Object {obj.get('id')}: {exc}")
 
-        # ── Build full open_urls: {base_url}/{rel} = {base_url}/ans?state=/... ───
+        # ── Build full open_urls ─────────────────────────────────────────────────
         full_open_urls: dict[str, list[str]] = {
-            obj_type: [f"{base_url}/{rel}" for rel in rels]
-            for obj_type, rels in rel_open_urls.items()
+            obj_type: [_open_url(base_url, obj_type, obj_id)
+                       for obj_id in [o.get("id", "") for o in validated
+                                      if o.get("type") == obj_type and o.get("id")]]
+            for obj_type in set(o.get("type", "") for o in validated
+                                if o.get("type") in ("chart", "dashboard"))
         }
 
         # Primary URL: dashboard first, then chart
