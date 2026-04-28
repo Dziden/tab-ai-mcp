@@ -623,19 +623,21 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
                             ref55 = read_1c("ChartOfAccounts_Хозрасчетный",
                                             filter="Code eq '55'", select="Ref_Key")[0]["Ref_Key"]
                           Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
-                            ⚠ ОБЯЗАТЕЛЬНО expand="Субконто1" — без него нет названия банковского счёта!
+                            ❌ НЕ использовать expand="Субконто1" — поля нет, будет HTTP 400!
+                            ❌ НЕ использовать expand="ExtDimension1" — HTTP 500 (слишком много колонок)!
                             rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
-                                             filter="Account_Key eq guid'<ref51>'", expand="Субконто1")
+                                             filter="Account_Key eq guid'<ref51>'")
                             rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
-                                             filter="Account_Key eq guid'<ref52>'", expand="Субконто1")
+                                             filter="Account_Key eq guid'<ref52>'")
                             rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'DATE')",
-                                             filter="Account_Key eq guid'<ref55>'", expand="Субконто1")
+                                             filter="Account_Key eq guid'<ref55>'")
                           Шаг 3. Формирование ответа:
-                            Название банковского счёта = row["Субконто1"]["Description"]
-                            ⚠ НЕ путать с ChartOfAccounts.Description ("Расчётные счета") —
-                              это имя счёта плана счетов, НЕ название банковского счёта!
-                            Рублёвый = Σ СуммаBalance (rows51 + rows55)
-                            Валютный = rows52 по Валюта_Key → ВалютнаяСуммаBalance каждой валюты
+                            ❌ НЕЛЬЗЯ включать СуммаBalance(52) в рублёвый итог!
+                              СуммаBalance счёта 52 = рублёвый ЭКВИВАЛЕНТ валюты, не реальные рубли.
+                            Рублёвый остаток = Σ СуммаBalance (rows51 + rows55) — счёт 52 ИСКЛЮЧИТЬ!
+                            Валютный остаток = rows52 по Валюта_Key → ВалютнаяСуммаBalance каждой валюты
+                            Субконто (банк. счёт) доступно через ExtDimension1 (GUID) + отдельный lookup:
+                              read_1c("Catalog_БанковскиеСчета", filter=f"Ref_Key eq guid'{row['ExtDimension1']}'", select="Description")
                           ═══════════════════════════════════════════════════════
 
             user_id:          ID пользователя (по умолчанию "").
