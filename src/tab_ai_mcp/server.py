@@ -852,7 +852,7 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
           database — идентификатор базы данных (application name) в сервере аналитики, например:
               "acc_gazprom_demo"
 
-          API endpoint:  PUT {analytics_url}/api/ans/objects
+          API endpoint:  PUT {analytics_url}/applications/{database}/api/ans/objects
           Viewer URL:    {analytics_url}/applications/{database}/ans?state=/{type}/{id}
 
           Аутентификация: Basic auth — login=identifier, password=key
@@ -1108,8 +1108,13 @@ def _make_mcp(instructions: str, prompts: list[dict]) -> FastMCP:
             return {"written": False, "objects": validated, "ids": ids, "open_urls": rel_open_urls}
 
         # ── Write each object to the analytics server ────────────────────────────
-        # API endpoint: {base_url}/api/ans/objects  (swagger: PUT /api/ans/objects)
-        api_endpoint = f"{base_url}/api/ans/objects"
+        # API endpoint structure:
+        #   with database:    {base_url}/applications/{database}/api/ans/objects
+        #   without database: {base_url}/api/ans/objects  (legacy / direct mount)
+        if _db:
+            api_endpoint = f"{base_url}/applications/{_db}/api/ans/objects"
+        else:
+            api_endpoint = f"{base_url}/api/ans/objects"
         errors: list[str] = []
 
         # Resolve credentials: login=identifier, password=key
