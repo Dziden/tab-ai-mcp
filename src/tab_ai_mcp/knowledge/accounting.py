@@ -123,14 +123,17 @@ INSTRUCTIONS = """
   Шаг 2. Balance для каждого счёта — ОТДЕЛЬНЫЙ запрос:
     ⚠ Period = дата из вопроса (например 2024-12-31), НЕ текущая дата!
     ⚠ НЕ использовать expand="Субконто1" — такого поля нет, будет HTTP 400!
-       Субконто доступны как ExtDimension1 (GUID), ExtDimension1_Type (тип справочника).
-       Для названия банковского счёта — отдельный lookup по ExtDimension1.
+    ⚠ ОБЯЗАТЕЛЬНО указывать select — без него Balance возвращает 40+ полей, большинство лишние!
+       Нужные поля: СуммаBalance, ВалютнаяСуммаBalance, Валюта_Key, ExtDimension1, ExtDimension1_Type, Организация_Key
     rows51 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                     filter=f"Account_Key eq guid'{ref51}'")
+                     filter=f"Account_Key eq guid'{ref51}'",
+                     select="СуммаBalance,ВалютнаяСуммаBalance,Валюта_Key,ExtDimension1,ExtDimension1_Type,Организация_Key")
     rows52 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                     filter=f"Account_Key eq guid'{ref52}'")
+                     filter=f"Account_Key eq guid'{ref52}'",
+                     select="СуммаBalance,ВалютнаяСуммаBalance,Валюта_Key,ExtDimension1,ExtDimension1_Type,Организация_Key")
     rows55 = read_1c("AccountingRegister_Хозрасчетный/Balance(Period=datetime'YYYY-MM-DDT00:00:00')",
-                     filter=f"Account_Key eq guid'{ref55}'")
+                     filter=f"Account_Key eq guid'{ref55}'",
+                     select="СуммаBalance,ВалютнаяСуммаBalance,Валюта_Key,ExtDimension1,ExtDimension1_Type,Организация_Key")
 
   Шаг 3. Формирование результата:
     ⚠ КРИТИЧНО: счёт 52 имеет ДВА значения остатка — не путать!
@@ -146,10 +149,19 @@ INSTRUCTIONS = """
       Валютный остаток = rows52 → сгруппировать по Валюта_Key → ВалютнаяСуммаBalance по каждой валюте
       Рублёвый эквивалент валюты (справочно) = Σ СуммаBalance по rows52
 
-    ⚠ НАЗВАНИЕ банковского счёта:
-      Каждая строка = один банковский счёт. Субконто в поле ExtDimension1 = GUID счёта.
-      Lookup: read_1c("Catalog_БанковскиеСчета", filter=f"Ref_Key eq guid'{row['ExtDimension1']}'", select="Description")
-      НЕ путать с ChartOfAccounts.Description ("Расчётные счета") — это имя счёта плана счетов!
+    Получение имён (обязательно для читаемого ответа):
+      Название банковского счёта (ExtDimension1_Type = "...Catalog_БанковскиеСчета"):
+        name = read_1c("Catalog_БанковскиеСчета",
+                       filter=f"Ref_Key eq guid'{row['ExtDimension1']}'",
+                       select="Description,НомерСчета")[0]["Description"]
+        → "40702810000000000007, ПАО СБЕРБАНК"
+      Организация (Организация_Key → Catalog_Организации):
+        org = read_1c("Catalog_Организации",
+                      filter=f"Ref_Key eq guid'{row['Организация_Key']}'",
+                      select="Description")[0]["Description"]
+        → "Конфетпром ООО"
+        ⚠ НЕ показывать GUID пользователю — всегда делать lookup!
+      НЕ путать ExtDimension1 с ChartOfAccounts.Description ("Расчётные счета") — это имя счёта плана счетов!
 
   Важно: ChartOfAccounts НЕ поддерживает 'or' в filter — делать отдельный запрос для каждого счета.
   Пример: Code eq '51' — работает. Code eq '51' or Code eq '52' — НЕ работает (500 ошибка).
