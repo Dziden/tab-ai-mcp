@@ -88,18 +88,17 @@ INSTRUCTIONS = """
     При нескольких уникальных ключах: собрать все уникальные GUID, сделать отдельные запросы.
 
   Для аналитики (субконто) в Balance/Turnovers:
-    expand="Субконто1,Субконто2" → поле Субконто1.Description содержит имя.
-    Субконто по счетам (типичная Бухгалтерия):
-      51 (Банк):  Субконто1 = Catalog_БанковскиеСчета (поле НомерСчета или Description)
-      60/62:      Субконто1 = Catalog_Контрагенты, Субконто2 = Catalog_ДоговорыКонтрагентов
-      10/41/43:   Субконто1 = Catalog_Номенклатура, Субконто2 = Catalog_Склады
-    Lookup: read_1c("Catalog_Контрагенты", filter=f"Ref_Key eq guid'{key}'", select="Description")
+    ⚠ expand="Субконто1" — НЕ работает (HTTP 400), поля с таким именем нет!
+    Субконто хранятся в плоских полях ExtDimension1, ExtDimension2 (содержат GUID объекта).
+    Тип объекта: row["ExtDimension1_Type"] → "StandardODATA.Catalog_БанковскиеСчета" и т.д.
+    Название: отдельный lookup по GUID:
+      name = read_1c("Catalog_БанковскиеСчета", filter=f"Ref_Key eq guid'{row['ExtDimension1']}'", select="Description")[0]["Description"]
 
   Субконто по счетам (типичная Бухгалтерия):
-    51 (Банк):      Субконто1 = Catalog_БанковскиеСчета, Субконто2 = Catalog_СтатьиДвиженияДенежныхСредств
-    60/62:          Субконто1 = Catalog_Контрагенты,     Субконто2 = Catalog_ДоговорыКонтрагентов
-    10/41/43:       Субконто1 = Catalog_Номенклатура,    Субконто2 = Catalog_Склады
-    68/69/70:       Субконто1 = Catalog_СотрудникиОрганизаций (или Catalog_Контрагенты)
+    51 (Банк):      ExtDimension1 = GUID из Catalog_БанковскиеСчета
+    60/62:          ExtDimension1 = GUID из Catalog_Контрагенты, ExtDimension2 = GUID из Catalog_ДоговорыКонтрагентов
+    10/41/43:       ExtDimension1 = GUID из Catalog_Номенклатура, ExtDimension2 = GUID из Catalog_Склады
+    68/69/70:       ExtDimension1 = GUID из Catalog_СотрудникиОрганизаций (или Catalog_Контрагенты)
 
 ⚠ ОСТАТОК ПО БАНКУ — запрашивать ВСЕ ТРИ счёта: 51, 52, 55 (НЕ только 51!):
 
